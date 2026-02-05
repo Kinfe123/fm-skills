@@ -9,6 +9,7 @@ These skills help AI assistants understand:
 - Build pipelines, bundling, code splitting, and optimization
 - Different rendering strategies and when to use each
 - SEO implications of architectural decisions
+- Universal JavaScript and cross-platform deployment (Nitro, H3, edge runtimes)
 - How meta-frameworks solve common problems
 - Hydration, routing, and other core concepts
 
@@ -27,6 +28,7 @@ Rather than framework-specific instructions, these skills provide the **conceptu
 | [state-management-patterns](./state-management-patterns/SKILL.md) | Client state, server state, URL state, caching |
 | [data-fetching-patterns](./data-fetching-patterns/SKILL.md) | Fetch patterns, caching, loading states |
 | [build-pipelines-bundling](./build-pipelines-bundling/SKILL.md) | Bundling, code splitting, tree shaking, build optimization |
+| [universal-javascript-runtimes](./universal-javascript-runtimes/SKILL.md) | Nitro, H3, unenv, web standards, cross-platform deployment |
 
 ## Learning Path
 
@@ -47,9 +49,11 @@ For best understanding, read the skills in this order:
         ↓
 7. state-management-patterns   (Where to store data)
         ↓
-8. seo-fundamentals            (Search engine optimization)
+8. seo-fundamentals              (Search engine optimization)
         ↓
-9. meta-frameworks-overview    (How frameworks implement all of the above)
+9. universal-javascript-runtimes (Deploy anywhere: edge, serverless, Node)
+        ↓
+10. meta-frameworks-overview     (How frameworks implement all of the above)
 ```
 
 ## Installation
