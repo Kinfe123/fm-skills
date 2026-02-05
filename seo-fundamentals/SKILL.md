@@ -749,6 +749,426 @@ ANTI-PATTERN: CSR FOR PUBLIC CONTENT
 - May rank poorly vs competitors
 ```
 
+---
+
+## For Framework Authors: Building SEO Systems
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building SEO systems. Head management can be handled via components (React Helmet), framework APIs (Next.js Metadata), or universal libraries (unhead). The direction shown here provides core concepts—adapt based on your framework's rendering model, SSR implementation, and whether you need streaming support.
+
+### Implementing Head Management
+
+```javascript
+// DOCUMENT HEAD MANAGEMENT
+
+class HeadManager {
+  constructor() {
+    this.tags = new Map();
+    this.order = [];
+  }
+  
+  // Add or update a head tag
+  setTag(id, tag) {
+    if (!this.tags.has(id)) {
+      this.order.push(id);
+    }
+    this.tags.set(id, tag);
+  }
+  
+  // Remove a tag
+  removeTag(id) {
+    this.tags.delete(id);
+    this.order = this.order.filter(i => i !== id);
+  }
+  
+  // Render to string (for SSR)
+  toString() {
+    return this.order
+      .map(id => this.renderTag(this.tags.get(id)))
+      .join('\n');
+  }
+  
+  renderTag(tag) {
+    const { type, ...attrs } = tag;
+    
+    if (type === 'title') {
+      return `<title>${escapeHtml(attrs.children)}</title>`;
+    }
+    
+    const attrStr = Object.entries(attrs)
+      .filter(([k]) => k !== 'children')
+      .map(([k, v]) => `${k}="${escapeHtml(v)}"`)
+      .join(' ');
+    
+    if (tag.children) {
+      return `<${type} ${attrStr}>${tag.children}</${type}>`;
+    }
+    
+    return `<${type} ${attrStr}>`;
+  }
+  
+  // Apply to DOM (for client-side)
+  applyToDOM() {
+    const head = document.head;
+    
+    for (const [id, tag] of this.tags) {
+      let existing = head.querySelector(`[data-head-id="${id}"]`);
+      
+      if (!existing) {
+        existing = document.createElement(tag.type);
+        existing.setAttribute('data-head-id', id);
+        head.appendChild(existing);
+      }
+      
+      // Update attributes
+      for (const [key, value] of Object.entries(tag)) {
+        if (key === 'type') continue;
+        if (key === 'children') {
+          existing.textContent = value;
+        } else {
+          existing.setAttribute(key, value);
+        }
+      }
+    }
+  }
+}
+
+// React hook for head management
+function useHead(tags) {
+  const headManager = useContext(HeadContext);
+  const id = useId();
+  
+  useEffect(() => {
+    // Apply on mount
+    Object.entries(tags).forEach(([key, value]) => {
+      headManager.setTag(`${id}-${key}`, value);
+    });
+    headManager.applyToDOM();
+    
+    // Cleanup on unmount
+    return () => {
+      Object.keys(tags).forEach(key => {
+        headManager.removeTag(`${id}-${key}`);
+      });
+      headManager.applyToDOM();
+    };
+  }, [JSON.stringify(tags)]);
+}
+
+// Usage
+function ProductPage({ product }) {
+  useHead({
+    title: { type: 'title', children: `${product.name} | Store` },
+    description: { type: 'meta', name: 'description', content: product.summary },
+    ogTitle: { type: 'meta', property: 'og:title', content: product.name },
+    ogImage: { type: 'meta', property: 'og:image', content: product.image },
+  });
+  
+  return <div>{/* ... */}</div>;
+}
+```
+
+### Building Structured Data Injection
+
+```javascript
+// STRUCTURED DATA (JSON-LD) SYSTEM
+
+class StructuredDataManager {
+  constructor() {
+    this.schemas = new Map();
+  }
+  
+  // Register schema for a route
+  setSchema(id, schema) {
+    this.schemas.set(id, schema);
+  }
+  
+  // Build JSON-LD from data
+  buildProductSchema(product) {
+    return {
+      '@context': 'https://schema.org',
+      '@type': 'Product',
+      name: product.name,
+      description: product.description,
+      image: product.images,
+      sku: product.sku,
+      brand: {
+        '@type': 'Brand',
+        name: product.brand,
+      },
+      offers: {
+        '@type': 'Offer',
+        url: product.url,
+        priceCurrency: product.currency,
+        price: product.price,
+        availability: product.inStock 
+          ? 'https://schema.org/InStock' 
+          : 'https://schema.org/OutOfStock',
+      },
+      aggregateRating: product.rating ? {
+        '@type': 'AggregateRating',
+        ratingValue: product.rating,
+        reviewCount: product.reviewCount,
+      } : undefined,
+    };
+  }
+  
+  buildBreadcrumbSchema(breadcrumbs) {
+    return {
+      '@context': 'https://schema.org',
+      '@type': 'BreadcrumbList',
+      itemListElement: breadcrumbs.map((crumb, i) => ({
+        '@type': 'ListItem',
+        position: i + 1,
+        item: {
+          '@id': crumb.url,
+          name: crumb.name,
+        },
+      })),
+    };
+  }
+  
+  buildArticleSchema(article) {
+    return {
+      '@context': 'https://schema.org',
+      '@type': 'Article',
+      headline: article.title,
+      description: article.excerpt,
+      image: article.image,
+      author: {
+        '@type': 'Person',
+        name: article.author.name,
+        url: article.author.url,
+      },
+      publisher: {
+        '@type': 'Organization',
+        name: article.publisher.name,
+        logo: {
+          '@type': 'ImageObject',
+          url: article.publisher.logo,
+        },
+      },
+      datePublished: article.publishedAt,
+      dateModified: article.updatedAt,
+    };
+  }
+  
+  // Render all schemas
+  toString() {
+    const schemas = Array.from(this.schemas.values());
+    if (schemas.length === 0) return '';
+    
+    const combined = schemas.length === 1 
+      ? schemas[0] 
+      : { '@context': 'https://schema.org', '@graph': schemas };
+    
+    return `<script type="application/ld+json">${
+      JSON.stringify(combined).replace(/</g, '\\u003c')
+    }</script>`;
+  }
+}
+```
+
+### Sitemap Generation
+
+```javascript
+// SITEMAP GENERATOR
+
+async function generateSitemap(config) {
+  const { baseUrl, routes, outputPath } = config;
+  
+  const urls = [];
+  
+  for (const route of routes) {
+    // Static routes
+    if (!route.isDynamic) {
+      urls.push({
+        loc: `${baseUrl}${route.path}`,
+        lastmod: route.lastModified || new Date().toISOString(),
+        changefreq: route.changefreq || 'weekly',
+        priority: route.priority || 0.7,
+      });
+      continue;
+    }
+    
+    // Dynamic routes - get all paths
+    if (route.getStaticPaths) {
+      const paths = await route.getStaticPaths();
+      for (const path of paths) {
+        const fullPath = route.path.replace(
+          /\[(\w+)\]/g,
+          (_, param) => path.params[param]
+        );
+        urls.push({
+          loc: `${baseUrl}${fullPath}`,
+          lastmod: path.lastModified || new Date().toISOString(),
+          changefreq: path.changefreq || 'weekly',
+          priority: path.priority || 0.5,
+        });
+      }
+    }
+  }
+  
+  // Generate XML
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls.map(url => `  <url>
+    <loc>${escapeXml(url.loc)}</loc>
+    <lastmod>${url.lastmod}</lastmod>
+    <changefreq>${url.changefreq}</changefreq>
+    <priority>${url.priority}</priority>
+  </url>`).join('\n')}
+</urlset>`;
+  
+  await fs.writeFile(outputPath, xml);
+  
+  // Generate sitemap index if too large
+  if (urls.length > 50000) {
+    return generateSitemapIndex(urls, config);
+  }
+  
+  return xml;
+}
+
+// Robots.txt generator
+function generateRobotsTxt(config) {
+  const { baseUrl, disallow = [], sitemap = true } = config;
+  
+  let content = `User-agent: *\n`;
+  
+  for (const path of disallow) {
+    content += `Disallow: ${path}\n`;
+  }
+  
+  if (sitemap) {
+    content += `\nSitemap: ${baseUrl}/sitemap.xml\n`;
+  }
+  
+  return content;
+}
+```
+
+### Canonical URL Management
+
+```javascript
+// CANONICAL URL SYSTEM
+
+class CanonicalManager {
+  constructor(baseUrl) {
+    this.baseUrl = baseUrl;
+  }
+  
+  // Generate canonical for a route
+  getCanonical(path, params = {}) {
+    // Remove trailing slash
+    let canonical = path.replace(/\/$/, '') || '/';
+    
+    // Normalize query params (sorted, only allowed ones)
+    const allowedParams = ['page', 'category', 'sort'];
+    const query = new URLSearchParams();
+    
+    for (const [key, value] of Object.entries(params)) {
+      if (allowedParams.includes(key) && value) {
+        query.set(key, value);
+      }
+    }
+    
+    const queryStr = query.toString();
+    if (queryStr) {
+      canonical += `?${queryStr}`;
+    }
+    
+    return `${this.baseUrl}${canonical}`;
+  }
+  
+  // Handle pagination canonicals
+  getPaginationCanonical(path, page, totalPages) {
+    // Page 1 should canonical to base URL
+    if (page === 1) {
+      return this.getCanonical(path);
+    }
+    
+    return this.getCanonical(path, { page });
+  }
+  
+  // Handle locale canonicals
+  getLocaleCanonical(path, locale, defaultLocale) {
+    if (locale === defaultLocale) {
+      return this.getCanonical(path);
+    }
+    return this.getCanonical(`/${locale}${path}`);
+  }
+  
+  // Generate hreflang tags
+  getHreflangTags(path, locales, defaultLocale) {
+    return locales.map(locale => ({
+      type: 'link',
+      rel: 'alternate',
+      hreflang: locale,
+      href: this.getLocaleCanonical(path, locale, defaultLocale),
+    })).concat({
+      type: 'link',
+      rel: 'alternate',
+      hreflang: 'x-default',
+      href: this.getCanonical(path),
+    });
+  }
+}
+```
+
+### Meta Tag Deduplication
+
+```javascript
+// META TAG DEDUPLICATION
+
+class MetaDeduplicator {
+  constructor() {
+    this.tags = [];
+  }
+  
+  // Add tag with deduplication key
+  add(tag) {
+    const key = this.getDeduplicationKey(tag);
+    
+    // Remove existing tag with same key
+    this.tags = this.tags.filter(t => 
+      this.getDeduplicationKey(t) !== key
+    );
+    
+    this.tags.push(tag);
+  }
+  
+  getDeduplicationKey(tag) {
+    if (tag.type === 'title') return 'title';
+    if (tag.name) return `name:${tag.name}`;
+    if (tag.property) return `property:${tag.property}`;
+    if (tag.httpEquiv) return `http-equiv:${tag.httpEquiv}`;
+    if (tag.rel === 'canonical') return 'canonical';
+    return JSON.stringify(tag);
+  }
+  
+  // Get final list (last added wins for duplicates)
+  getTags() {
+    return this.tags;
+  }
+}
+
+// Integration with nested routes
+function collectMetaTags(routeHierarchy) {
+  const dedup = new MetaDeduplicator();
+  
+  // Apply from root to leaf (later overrides earlier)
+  for (const route of routeHierarchy) {
+    if (route.meta) {
+      for (const tag of route.meta) {
+        dedup.add(tag);
+      }
+    }
+  }
+  
+  return dedup.getTags();
+}
+```
+
 ## Related Skills
 
 - See [web-app-architectures](../web-app-architectures/SKILL.md) for SPA vs MPA

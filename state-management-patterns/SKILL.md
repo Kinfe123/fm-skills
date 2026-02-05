@@ -907,6 +907,483 @@ function Header() {
 }
 ```
 
+---
+
+## For Framework Authors: Building State Management Systems
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building state management systems. Reactivity can be implemented many ways—Vue uses proxies, Solid uses signals, Svelte uses compile-time reactivity, and React uses explicit setState. The direction shown here (signals-based) is increasingly popular but not the only valid approach. Choose based on your framework's rendering model, bundle size goals, and developer ergonomics.
+
+### Implementing a Reactivity System
+
+```javascript
+// SIGNALS-BASED REACTIVITY (SolidJS/Preact-style)
+
+let currentObserver = null;
+let batchedUpdates = [];
+let isBatching = false;
+
+function createSignal(initialValue) {
+  let value = initialValue;
+  const subscribers = new Set();
+  
+  function read() {
+    // Track dependency
+    if (currentObserver) {
+      subscribers.add(currentObserver);
+    }
+    return value;
+  }
+  
+  function write(newValue) {
+    if (value !== newValue) {
+      value = newValue;
+      
+      if (isBatching) {
+        // Queue updates
+        subscribers.forEach(s => {
+          if (!batchedUpdates.includes(s)) {
+            batchedUpdates.push(s);
+          }
+        });
+      } else {
+        // Execute immediately
+        subscribers.forEach(s => s());
+      }
+    }
+  }
+  
+  return [read, write];
+}
+
+function createEffect(fn) {
+  const effect = () => {
+    // Clear previous dependencies
+    currentObserver = effect;
+    try {
+      fn();
+    } finally {
+      currentObserver = null;
+    }
+  };
+  
+  // Run immediately to collect dependencies
+  effect();
+}
+
+function createMemo(fn) {
+  const [value, setValue] = createSignal(undefined);
+  createEffect(() => setValue(fn()));
+  return value;
+}
+
+function batch(fn) {
+  isBatching = true;
+  try {
+    fn();
+  } finally {
+    isBatching = false;
+    // Flush batched updates
+    const updates = [...new Set(batchedUpdates)];
+    batchedUpdates = [];
+    updates.forEach(u => u());
+  }
+}
+
+// Usage
+const [count, setCount] = createSignal(0);
+const [name, setName] = createSignal('World');
+
+const greeting = createMemo(() => `Hello, ${name()}! Count: ${count()}`);
+
+createEffect(() => {
+  console.log(greeting()); // Re-runs when count or name change
+});
+
+batch(() => {
+  setCount(1);
+  setName('User');
+  // Only one console.log, not two
+});
+```
+
+### Building a Store System
+
+```javascript
+// GLOBAL STORE IMPLEMENTATION
+
+function createStore(initialState) {
+  let state = initialState;
+  const listeners = new Set();
+  
+  function getState() {
+    return state;
+  }
+  
+  function setState(updater) {
+    const nextState = typeof updater === 'function' 
+      ? updater(state) 
+      : updater;
+    
+    // Shallow merge for objects
+    if (typeof nextState === 'object' && !Array.isArray(nextState)) {
+      state = { ...state, ...nextState };
+    } else {
+      state = nextState;
+    }
+    
+    // Notify listeners
+    listeners.forEach(listener => listener(state));
+  }
+  
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+  
+  // Selector-based subscription (only notify on selected change)
+  function subscribeWithSelector(selector, listener) {
+    let currentSelection = selector(state);
+    
+    return subscribe((newState) => {
+      const newSelection = selector(newState);
+      if (!Object.is(currentSelection, newSelection)) {
+        currentSelection = newSelection;
+        listener(newSelection);
+      }
+    });
+  }
+  
+  return { getState, setState, subscribe, subscribeWithSelector };
+}
+
+// React integration
+function useStore(store, selector = s => s) {
+  const [state, setState] = useState(() => selector(store.getState()));
+  
+  useEffect(() => {
+    return store.subscribeWithSelector(selector, setState);
+  }, [store, selector]);
+  
+  return state;
+}
+
+// Middleware support
+function applyMiddleware(...middlewares) {
+  return (createStore) => (initialState) => {
+    const store = createStore(initialState);
+    
+    let dispatch = store.setState;
+    
+    const api = {
+      getState: store.getState,
+      dispatch: (action) => dispatch(action),
+    };
+    
+    const chain = middlewares.map(mw => mw(api));
+    dispatch = compose(...chain)(store.setState);
+    
+    return { ...store, setState: dispatch };
+  };
+}
+
+// Logger middleware
+const logger = (api) => (next) => (action) => {
+  console.log('Before:', api.getState());
+  next(action);
+  console.log('After:', api.getState());
+};
+```
+
+### Implementing Context System
+
+```javascript
+// CONTEXT IMPLEMENTATION
+
+const contextMap = new Map();
+
+function createContext(defaultValue) {
+  const id = Symbol('context');
+  
+  function Provider({ value, children }) {
+    // Store value in render context
+    const prevValue = contextMap.get(id);
+    contextMap.set(id, value);
+    
+    try {
+      return children;
+    } finally {
+      // Restore on cleanup
+      if (prevValue !== undefined) {
+        contextMap.set(id, prevValue);
+      } else {
+        contextMap.delete(id);
+      }
+    }
+  }
+  
+  function useContext() {
+    return contextMap.has(id) ? contextMap.get(id) : defaultValue;
+  }
+  
+  return { Provider, useContext, id };
+}
+
+// Scoped context (for server components)
+class ContextScope {
+  constructor(parent = null) {
+    this.values = new Map();
+    this.parent = parent;
+  }
+  
+  provide(context, value) {
+    this.values.set(context.id, value);
+  }
+  
+  consume(context) {
+    if (this.values.has(context.id)) {
+      return this.values.get(context.id);
+    }
+    if (this.parent) {
+      return this.parent.consume(context);
+    }
+    return context.defaultValue;
+  }
+  
+  fork() {
+    return new ContextScope(this);
+  }
+}
+
+// Async context (for server-side request scope)
+import { AsyncLocalStorage } from 'async_hooks';
+
+const asyncContext = new AsyncLocalStorage();
+
+function runWithContext(context, fn) {
+  return asyncContext.run(context, fn);
+}
+
+function getCurrentContext() {
+  return asyncContext.getStore();
+}
+```
+
+### Server State Cache Implementation
+
+```javascript
+// SERVER STATE CACHE (TanStack Query style)
+
+class QueryClient {
+  constructor() {
+    this.cache = new Map();
+    this.subscribers = new Map();
+    this.defaultOptions = {
+      staleTime: 0,
+      cacheTime: 5 * 60 * 1000,
+      retry: 3,
+    };
+  }
+  
+  getQueryData(key) {
+    const keyStr = JSON.stringify(key);
+    return this.cache.get(keyStr)?.data;
+  }
+  
+  setQueryData(key, updater) {
+    const keyStr = JSON.stringify(key);
+    const current = this.cache.get(keyStr);
+    const newData = typeof updater === 'function' 
+      ? updater(current?.data) 
+      : updater;
+    
+    this.cache.set(keyStr, {
+      data: newData,
+      timestamp: Date.now(),
+      status: 'success',
+    });
+    
+    this.notifySubscribers(keyStr);
+  }
+  
+  invalidateQueries(key) {
+    const keyStr = JSON.stringify(key);
+    const entry = this.cache.get(keyStr);
+    if (entry) {
+      entry.isStale = true;
+      this.notifySubscribers(keyStr);
+    }
+  }
+  
+  subscribe(key, callback) {
+    const keyStr = JSON.stringify(key);
+    if (!this.subscribers.has(keyStr)) {
+      this.subscribers.set(keyStr, new Set());
+    }
+    this.subscribers.get(keyStr).add(callback);
+    
+    return () => {
+      this.subscribers.get(keyStr)?.delete(callback);
+    };
+  }
+  
+  notifySubscribers(keyStr) {
+    this.subscribers.get(keyStr)?.forEach(cb => cb());
+  }
+}
+
+// Query hook implementation
+function useQuery(key, queryFn, options = {}) {
+  const client = useQueryClient();
+  const [state, setState] = useState(() => {
+    const cached = client.getQueryData(key);
+    return {
+      data: cached,
+      isLoading: !cached,
+      error: null,
+      isStale: true,
+    };
+  });
+  
+  useEffect(() => {
+    const keyStr = JSON.stringify(key);
+    let cancelled = false;
+    
+    async function fetch() {
+      setState(s => ({ ...s, isLoading: true }));
+      
+      try {
+        const data = await queryFn();
+        if (!cancelled) {
+          client.setQueryData(key, data);
+          setState({ data, isLoading: false, error: null, isStale: false });
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setState(s => ({ ...s, isLoading: false, error }));
+        }
+      }
+    }
+    
+    // Check if data is stale
+    const cached = client.cache.get(keyStr);
+    const isStale = !cached || 
+      Date.now() - cached.timestamp > (options.staleTime || 0);
+    
+    if (isStale) {
+      fetch();
+    }
+    
+    // Subscribe to invalidations
+    const unsubscribe = client.subscribe(key, fetch);
+    
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [JSON.stringify(key)]);
+  
+  return state;
+}
+```
+
+### URL State Synchronization
+
+```javascript
+// URL STATE SYNC IMPLEMENTATION
+
+function createURLState(schema) {
+  function parse() {
+    const params = new URLSearchParams(window.location.search);
+    const state = {};
+    
+    for (const [key, config] of Object.entries(schema)) {
+      const value = params.get(key);
+      
+      if (value === null) {
+        state[key] = config.default;
+      } else {
+        // Parse based on type
+        switch (config.type) {
+          case 'number':
+            state[key] = Number(value);
+            break;
+          case 'boolean':
+            state[key] = value === 'true';
+            break;
+          case 'array':
+            state[key] = value.split(',');
+            break;
+          default:
+            state[key] = value;
+        }
+      }
+    }
+    
+    return state;
+  }
+  
+  function stringify(state) {
+    const params = new URLSearchParams();
+    
+    for (const [key, value] of Object.entries(state)) {
+      const config = schema[key];
+      
+      // Skip defaults
+      if (value === config?.default) continue;
+      
+      if (Array.isArray(value)) {
+        params.set(key, value.join(','));
+      } else if (value !== undefined && value !== null) {
+        params.set(key, String(value));
+      }
+    }
+    
+    return params.toString();
+  }
+  
+  function update(newState, options = { replace: false }) {
+    const merged = { ...parse(), ...newState };
+    const queryString = stringify(merged);
+    const url = queryString 
+      ? `${window.location.pathname}?${queryString}`
+      : window.location.pathname;
+    
+    if (options.replace) {
+      history.replaceState(null, '', url);
+    } else {
+      history.pushState(null, '', url);
+    }
+    
+    // Dispatch custom event for listeners
+    window.dispatchEvent(new CustomEvent('urlstatechange', { detail: merged }));
+  }
+  
+  return { parse, stringify, update };
+}
+
+// React hook
+function useURLState(schema) {
+  const urlState = useMemo(() => createURLState(schema), []);
+  const [state, setState] = useState(urlState.parse);
+  
+  useEffect(() => {
+    const handler = () => setState(urlState.parse());
+    window.addEventListener('popstate', handler);
+    window.addEventListener('urlstatechange', handler);
+    return () => {
+      window.removeEventListener('popstate', handler);
+      window.removeEventListener('urlstatechange', handler);
+    };
+  }, []);
+  
+  const setURLState = useCallback((updates) => {
+    urlState.update(updates);
+  }, []);
+  
+  return [state, setURLState];
+}
+```
+
 ## Related Skills
 
 - See [web-app-architectures](../web-app-architectures/SKILL.md) for SPA state persistence

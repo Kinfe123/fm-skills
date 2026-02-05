@@ -177,22 +177,38 @@ const posts = await getPosts(user.id);
 
 ### Streaming and Suspense
 
-Send HTML progressively as data arrives:
+Stream HTML to the browser as soon as each part of your UI is ready—even if it's out of order—letting users see content without having to wait for everything.
+
+- **Progressive & Out-of-Order Streaming:** With React's server components and Suspense, the server can send parts of the page (like headers or footers) immediately, even if other parts (like a slow data section) are still loading. This means sections of your UI don't have to stream in their coded order—each streams independently as soon as its data is ready.
+- **Suspense Boundaries & Placeholders:** The `<Suspense>` boundary tells React where some data may take longer. While waiting, a fallback component (such as `<Loading />`) is sent as a placeholder in the HTML.
+- **Client-Side JS Swapping:** Along with the initial HTML and placeholders, React also sends a small client-side JavaScript "runtime" that listens for streamed content. When the slow component's data arrives from the server, this client JS automatically swaps out the placeholder fallback for the real content—right in place, without a full page reload.
 
 ```jsx
-// Layout streams immediately
-// Slow component streams when ready
+// Example: Immediate and slow components streamed out of order
+
 async function Page() {
   return (
     <div>
-      <Header />  {/* Immediate */}
+      <Header /> 
+      {/* <Header> streams to client immediately */}
+      
       <Suspense fallback={<Loading />}>
-        <SlowComponent />  {/* Streams when ready */}
+        <SlowComponent />
+        {/* Placeholder <Loading /> is shown, and client JS
+            will replace it with <SlowComponent> content
+            as soon as the server streams it */}
       </Suspense>
-      <Footer />  {/* Immediate */}
+      
+      <Footer />
+      {/* <Footer> can stream immediately,
+          before or after <SlowComponent>, depending on what finishes first */}
     </div>
   );
 }
+```
+
+React's streaming SSR means the server sends "islands" of ready UI as soon as they're done, wherever they are in the code. The browser shows the page piecemeal, filling in slow spots later. The React client runtime handles swapping placeholders for finished components when each chunk of streamed content completes, providing a smooth and efficient user experience.
+
 ```
 
 ## Caching Patterns
@@ -1004,6 +1020,489 @@ async function dedupedFetch(key, fetchFn) {
 // Both calls share the SAME network request
 const data1 = await dedupedFetch('user', () => fetch('/api/user'));
 const data2 = await dedupedFetch('user', () => fetch('/api/user'));
+```
+
+---
+
+## For Framework Authors: Building Data Fetching Systems
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building data fetching systems. Different frameworks take different approaches—Remix uses loaders, React Query focuses on caching, and Next.js integrates with its rendering model. The direction shown here covers core primitives most data systems need. Adapt based on your framework's server/client boundaries, caching strategy, and how you handle loading states.
+
+### Implementing Request Deduplication
+
+```javascript
+// REQUEST DEDUPLICATION IMPLEMENTATION
+
+class RequestDeduplicator {
+  constructor() {
+    this.inflight = new Map();
+    this.cache = new Map();
+  }
+  
+  async fetch(key, fetcher, options = {}) {
+    const { ttl = 0, forceRefresh = false } = options;
+    const keyStr = typeof key === 'string' ? key : JSON.stringify(key);
+    
+    // Check cache first
+    if (!forceRefresh && this.cache.has(keyStr)) {
+      const cached = this.cache.get(keyStr);
+      if (Date.now() - cached.timestamp < ttl) {
+        return cached.data;
+      }
+    }
+    
+    // Check if request is already in flight
+    if (this.inflight.has(keyStr)) {
+      return this.inflight.get(keyStr);
+    }
+    
+    // Create new request
+    const promise = fetcher()
+      .then(data => {
+        this.cache.set(keyStr, { data, timestamp: Date.now() });
+        this.inflight.delete(keyStr);
+        return data;
+      })
+      .catch(error => {
+        this.inflight.delete(keyStr);
+        throw error;
+      });
+    
+    this.inflight.set(keyStr, promise);
+    return promise;
+  }
+  
+  invalidate(key) {
+    const keyStr = typeof key === 'string' ? key : JSON.stringify(key);
+    this.cache.delete(keyStr);
+  }
+  
+  invalidateMatching(predicate) {
+    for (const key of this.cache.keys()) {
+      if (predicate(key)) {
+        this.cache.delete(key);
+      }
+    }
+  }
+}
+
+// Per-request deduplication (for SSR)
+function createRequestScopedCache() {
+  const cache = new Map();
+  
+  return function cachedFetch(url, options) {
+    const key = `${options?.method || 'GET'}:${url}`;
+    
+    if (cache.has(key)) {
+      return cache.get(key);
+    }
+    
+    const promise = fetch(url, options).then(r => r.json());
+    cache.set(key, promise);
+    
+    return promise;
+  };
+}
+```
+
+### Building a Data Loader System
+
+```javascript
+// DATA LOADER SYSTEM (Framework Integration)
+
+class DataLoader {
+  constructor() {
+    this.loaders = new Map();
+    this.cache = new Map();
+  }
+  
+  // Register a loader for a route
+  register(routeId, loader) {
+    this.loaders.set(routeId, loader);
+  }
+  
+  // Load data for matched routes (parallel)
+  async loadRoute(matches, request) {
+    const results = await Promise.all(
+      matches.map(async (match) => {
+        const loader = this.loaders.get(match.route.id);
+        if (!loader) return { routeId: match.route.id, data: null };
+        
+        const data = await loader({
+          params: match.params,
+          request,
+          context: {},
+        });
+        
+        return { routeId: match.route.id, data };
+      })
+    );
+    
+    // Return as map
+    return new Map(results.map(r => [r.routeId, r.data]));
+  }
+  
+  // Parallel data loading with dependencies
+  async loadWithDeps(loaderGraph, request) {
+    const results = new Map();
+    const pending = new Set(loaderGraph.keys());
+    
+    while (pending.size > 0) {
+      // Find loaders whose dependencies are satisfied
+      const ready = [...pending].filter(id => {
+        const deps = loaderGraph.get(id).dependsOn || [];
+        return deps.every(d => results.has(d));
+      });
+      
+      if (ready.length === 0 && pending.size > 0) {
+        throw new Error('Circular dependency detected');
+      }
+      
+      // Load in parallel
+      await Promise.all(
+        ready.map(async (id) => {
+          const { loader, dependsOn = [] } = loaderGraph.get(id);
+          const depData = Object.fromEntries(
+            dependsOn.map(d => [d, results.get(d)])
+          );
+          
+          const data = await loader({ request, deps: depData });
+          results.set(id, data);
+          pending.delete(id);
+        })
+      );
+    }
+    
+    return results;
+  }
+}
+```
+
+### Implementing Suspense-Compatible Data Fetching
+
+```javascript
+// SUSPENSE DATA FETCHING
+
+function createResource(fetcher) {
+  let status = 'pending';
+  let result;
+  
+  const promise = fetcher()
+    .then(data => {
+      status = 'success';
+      result = data;
+    })
+    .catch(error => {
+      status = 'error';
+      result = error;
+    });
+  
+  return {
+    read() {
+      switch (status) {
+        case 'pending':
+          throw promise; // Suspense catches this
+        case 'error':
+          throw result;  // ErrorBoundary catches this
+        case 'success':
+          return result;
+      }
+    },
+  };
+}
+
+// Cache wrapper for resources
+const resourceCache = new Map();
+
+function getResource(key, fetcher) {
+  if (!resourceCache.has(key)) {
+    resourceCache.set(key, createResource(fetcher));
+  }
+  return resourceCache.get(key);
+}
+
+// Pre-load resources before rendering
+function preloadResource(key, fetcher) {
+  if (!resourceCache.has(key)) {
+    resourceCache.set(key, createResource(fetcher));
+  }
+}
+
+// Clear resource cache
+function invalidateResource(key) {
+  resourceCache.delete(key);
+}
+
+// Usage pattern
+function UserProfile({ userId }) {
+  const resource = getResource(
+    ['user', userId],
+    () => fetch(`/api/users/${userId}`).then(r => r.json())
+  );
+  
+  // Will suspend until data is ready
+  const user = resource.read();
+  
+  return <div>{user.name}</div>;
+}
+```
+
+### Streaming Data Implementation
+
+```javascript
+// STREAMING DATA LOADING
+
+async function* streamJSON(url) {
+  const response = await fetch(url);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    
+    buffer += decoder.decode(value, { stream: true });
+    
+    // Try to parse complete JSON objects (newline-delimited)
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // Keep incomplete line
+    
+    for (const line of lines) {
+      if (line.trim()) {
+        yield JSON.parse(line);
+      }
+    }
+  }
+  
+  // Parse remaining buffer
+  if (buffer.trim()) {
+    yield JSON.parse(buffer);
+  }
+}
+
+// Server-Sent Events for real-time data
+function createSSEConnection(url) {
+  const eventSource = new EventSource(url);
+  const listeners = new Set();
+  
+  eventSource.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    listeners.forEach(l => l(data));
+  };
+  
+  return {
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    close() {
+      eventSource.close();
+    },
+  };
+}
+
+// React hook for streaming data
+function useStreamingData(url) {
+  const [items, setItems] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  
+  useEffect(() => {
+    let cancelled = false;
+    
+    async function stream() {
+      for await (const item of streamJSON(url)) {
+        if (cancelled) break;
+        setItems(prev => [...prev, item]);
+      }
+      setIsLoading(false);
+    }
+    
+    stream();
+    return () => { cancelled = true; };
+  }, [url]);
+  
+  return { items, isLoading };
+}
+```
+
+### Building an Optimistic Update System
+
+```javascript
+// OPTIMISTIC UPDATES IMPLEMENTATION
+
+class OptimisticUpdateManager {
+  constructor(queryClient) {
+    this.queryClient = queryClient;
+    this.pendingUpdates = new Map();
+  }
+  
+  async mutate(key, mutationFn, options = {}) {
+    const { 
+      optimisticUpdate, 
+      rollback = true,
+      invalidateKeys = [],
+    } = options;
+    
+    const keyStr = JSON.stringify(key);
+    
+    // Snapshot current state
+    const previousData = this.queryClient.getQueryData(key);
+    const mutationId = Date.now().toString();
+    
+    try {
+      // Apply optimistic update
+      if (optimisticUpdate) {
+        const optimisticData = optimisticUpdate(previousData);
+        this.queryClient.setQueryData(key, optimisticData);
+        this.pendingUpdates.set(mutationId, { key, previousData });
+      }
+      
+      // Execute actual mutation
+      const result = await mutationFn();
+      
+      // Update with server result
+      if (result !== undefined) {
+        this.queryClient.setQueryData(key, result);
+      }
+      
+      // Invalidate related queries
+      for (const invalidateKey of invalidateKeys) {
+        this.queryClient.invalidateQueries(invalidateKey);
+      }
+      
+      this.pendingUpdates.delete(mutationId);
+      return result;
+      
+    } catch (error) {
+      // Rollback on error
+      if (rollback && this.pendingUpdates.has(mutationId)) {
+        const { previousData } = this.pendingUpdates.get(mutationId);
+        this.queryClient.setQueryData(key, previousData);
+        this.pendingUpdates.delete(mutationId);
+      }
+      
+      throw error;
+    }
+  }
+  
+  // Batch multiple optimistic updates
+  async batchMutate(mutations) {
+    const snapshots = mutations.map(m => ({
+      key: m.key,
+      previous: this.queryClient.getQueryData(m.key),
+    }));
+    
+    // Apply all optimistic updates
+    mutations.forEach((m, i) => {
+      if (m.optimisticUpdate) {
+        const data = m.optimisticUpdate(snapshots[i].previous);
+        this.queryClient.setQueryData(m.key, data);
+      }
+    });
+    
+    try {
+      // Execute all mutations in parallel
+      const results = await Promise.all(
+        mutations.map(m => m.mutationFn())
+      );
+      return results;
+      
+    } catch (error) {
+      // Rollback all
+      snapshots.forEach(s => {
+        this.queryClient.setQueryData(s.key, s.previous);
+      });
+      throw error;
+    }
+  }
+}
+```
+
+### Cache Invalidation Strategies
+
+```javascript
+// CACHE INVALIDATION PATTERNS
+
+class CacheInvalidator {
+  constructor(cache) {
+    this.cache = cache;
+    this.tags = new Map(); // tag -> Set of keys
+  }
+  
+  // Associate cache entry with tags
+  setWithTags(key, value, tags = []) {
+    this.cache.set(key, value);
+    
+    for (const tag of tags) {
+      if (!this.tags.has(tag)) {
+        this.tags.set(tag, new Set());
+      }
+      this.tags.get(tag).add(key);
+    }
+  }
+  
+  // Invalidate by exact key
+  invalidateKey(key) {
+    this.cache.delete(key);
+  }
+  
+  // Invalidate by tag
+  invalidateTag(tag) {
+    const keys = this.tags.get(tag);
+    if (keys) {
+      for (const key of keys) {
+        this.cache.delete(key);
+      }
+      this.tags.delete(tag);
+    }
+  }
+  
+  // Invalidate by pattern
+  invalidatePattern(pattern) {
+    const regex = new RegExp(pattern);
+    for (const key of this.cache.keys()) {
+      if (regex.test(key)) {
+        this.cache.delete(key);
+      }
+    }
+  }
+  
+  // Time-based invalidation
+  setWithTTL(key, value, ttlMs) {
+    this.cache.set(key, {
+      value,
+      expiresAt: Date.now() + ttlMs,
+    });
+    
+    // Schedule cleanup
+    setTimeout(() => this.cache.delete(key), ttlMs);
+  }
+}
+
+// Webhook-based invalidation (for ISR)
+async function handleRevalidationWebhook(request) {
+  const { type, id, tags } = await request.json();
+  
+  // Verify webhook signature
+  const signature = request.headers.get('x-webhook-signature');
+  if (!verifySignature(signature, request.body)) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+  
+  // Invalidate based on payload
+  if (id) {
+    await revalidatePath(`/${type}/${id}`);
+  }
+  
+  if (tags) {
+    for (const tag of tags) {
+      await revalidateTag(tag);
+    }
+  }
+  
+  return new Response('OK');
+}
 ```
 
 ## Related Skills

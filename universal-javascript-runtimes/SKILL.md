@@ -1123,6 +1123,700 @@ Use HYBRID when:
 └─► Most production applications!
 ```
 
+---
+
+## For Framework Authors: Building Universal Runtime Systems
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building universal runtime systems. The adapter pattern shown here is inspired by Nitro/H3 but other approaches exist—SvelteKit uses a similar adapter system, while Remix uses a different deployment abstraction. The direction shown here provides portable patterns based on web standards. Adapt based on which runtimes you need to support and your polyfill strategy.
+
+### Creating Runtime Adapters
+
+```javascript
+// NITRO-STYLE ADAPTER PATTERN
+
+class RuntimeAdapter {
+  constructor(name, options = {}) {
+    this.name = name;
+    this.options = options;
+  }
+  
+  // Transform the universal handler for target runtime
+  async adapt(handler, buildOutput) {
+    throw new Error('Must implement adapt()');
+  }
+  
+  // Generate entry point for runtime
+  generateEntry() {
+    throw new Error('Must implement generateEntry()');
+  }
+  
+  // Get runtime-specific build config
+  getBuildConfig() {
+    return {};
+  }
+}
+
+// Node.js Adapter
+class NodeAdapter extends RuntimeAdapter {
+  constructor(options = {}) {
+    super('node', options);
+    this.port = options.port || 3000;
+  }
+  
+  generateEntry() {
+    return `
+import { createServer } from 'node:http';
+import { toNodeHandler } from 'h3';
+import { app } from '#internal/app';
+
+const handler = toNodeHandler(app);
+const server = createServer(handler);
+
+server.listen(${this.port}, () => {
+  console.log(\`Server running on http://localhost:${this.port}\`);
+});
+    `.trim();
+  }
+  
+  getBuildConfig() {
+    return {
+      target: 'node',
+      external: ['node:*'],
+      minify: false,
+    };
+  }
+}
+
+// Cloudflare Workers Adapter
+class CloudflareAdapter extends RuntimeAdapter {
+  constructor(options = {}) {
+    super('cloudflare', options);
+  }
+  
+  generateEntry() {
+    return `
+import { toWebHandler } from 'h3';
+import { app } from '#internal/app';
+
+const handler = toWebHandler(app);
+
+export default {
+  async fetch(request, env, ctx) {
+    // Inject environment bindings
+    globalThis.__env__ = env;
+    
+    return handler(request, {
+      waitUntil: (p) => ctx.waitUntil(p),
+      passThroughOnException: () => ctx.passThroughOnException(),
+    });
+  },
+};
+    `.trim();
+  }
+  
+  getBuildConfig() {
+    return {
+      target: 'webworker',
+      format: 'esm',
+      external: [],
+      minify: true,
+      define: {
+        'process.env.NODE_ENV': '"production"',
+      },
+    };
+  }
+}
+
+// Vercel Edge Adapter
+class VercelEdgeAdapter extends RuntimeAdapter {
+  constructor(options = {}) {
+    super('vercel-edge', options);
+  }
+  
+  generateEntry() {
+    return `
+import { toWebHandler } from 'h3';
+import { app } from '#internal/app';
+
+const handler = toWebHandler(app);
+
+export const config = { runtime: 'edge' };
+
+export default function (request) {
+  return handler(request);
+}
+    `.trim();
+  }
+  
+  // Generate vercel.json config
+  generateConfig(routes) {
+    return {
+      version: 3,
+      routes: routes.map(r => ({
+        src: r.pattern,
+        dest: r.handler,
+      })),
+    };
+  }
+}
+
+// AWS Lambda Adapter
+class LambdaAdapter extends RuntimeAdapter {
+  constructor(options = {}) {
+    super('lambda', options);
+  }
+  
+  generateEntry() {
+    return `
+import { toWebHandler } from 'h3';
+import { app } from '#internal/app';
+
+const handler = toWebHandler(app);
+
+export async function handler(event, context) {
+  // Convert Lambda event to Web Request
+  const request = lambdaToRequest(event);
+  
+  // Handle request
+  const response = await handler(request);
+  
+  // Convert Web Response to Lambda response
+  return responseToLambda(response);
+}
+
+function lambdaToRequest(event) {
+  const url = \`https://\${event.headers.host}\${event.rawPath}\`;
+  return new Request(url, {
+    method: event.requestContext.http.method,
+    headers: event.headers,
+    body: event.body,
+  });
+}
+
+async function responseToLambda(response) {
+  return {
+    statusCode: response.status,
+    headers: Object.fromEntries(response.headers),
+    body: await response.text(),
+    isBase64Encoded: false,
+  };
+}
+    `.trim();
+  }
+}
+```
+
+### Implementing Polyfill Presets
+
+```javascript
+// UNENV-STYLE POLYFILL SYSTEM
+
+class EnvironmentPreset {
+  constructor(name) {
+    this.name = name;
+    this.polyfills = new Map();
+    this.aliases = new Map();
+    this.globals = new Map();
+    this.external = new Set();
+  }
+  
+  // Register a polyfill for a module
+  polyfill(module, implementation) {
+    this.polyfills.set(module, implementation);
+    return this;
+  }
+  
+  // Alias one module to another
+  alias(from, to) {
+    this.aliases.set(from, to);
+    return this;
+  }
+  
+  // Define global injection
+  global(name, value) {
+    this.globals.set(name, value);
+    return this;
+  }
+  
+  // Mark module as external
+  external(module) {
+    this.external.add(module);
+    return this;
+  }
+  
+  // Generate bundler config
+  toBundlerConfig() {
+    return {
+      alias: Object.fromEntries(this.aliases),
+      define: Object.fromEntries(
+        [...this.globals].map(([k, v]) => [`globalThis.${k}`, v])
+      ),
+      external: [...this.external],
+    };
+  }
+}
+
+// Node preset for edge runtimes
+const nodePresetForEdge = new EnvironmentPreset('node-edge')
+  // Polyfill Node.js built-ins with web-compatible versions
+  .polyfill('node:buffer', 'unenv/runtime/node/buffer')
+  .polyfill('node:crypto', 'unenv/runtime/node/crypto')
+  .polyfill('node:stream', 'unenv/runtime/node/stream')
+  .polyfill('node:events', 'unenv/runtime/node/events')
+  .polyfill('node:util', 'unenv/runtime/node/util')
+  .polyfill('node:path', 'unenv/runtime/node/path')
+  .polyfill('node:url', 'unenv/runtime/node/url')
+  
+  // Stub Node.js modules not available on edge
+  .polyfill('node:fs', 'unenv/runtime/mock/empty')
+  .polyfill('node:child_process', 'unenv/runtime/mock/empty')
+  .polyfill('node:net', 'unenv/runtime/mock/empty')
+  .polyfill('node:tls', 'unenv/runtime/mock/empty')
+  
+  // Global injections
+  .global('process', 'unenv/runtime/node/process')
+  .global('Buffer', 'unenv/runtime/node/buffer')
+  
+  // Aliases
+  .alias('buffer', 'node:buffer')
+  .alias('stream', 'node:stream')
+  .alias('events', 'node:events');
+
+// Create polyfill bundle
+function createPolyfillBundle(preset) {
+  const imports = [];
+  const exports = [];
+  
+  for (const [module, impl] of preset.polyfills) {
+    const safeName = module.replace(/[^a-z0-9]/gi, '_');
+    imports.push(`import * as ${safeName} from '${impl}';`);
+    exports.push(`'${module}': ${safeName},`);
+  }
+  
+  return `
+${imports.join('\n')}
+
+export const polyfills = {
+  ${exports.join('\n  ')}
+};
+
+// Auto-inject polyfills
+for (const [name, impl] of Object.entries(polyfills)) {
+  globalThis.__modules__ = globalThis.__modules__ || {};
+  globalThis.__modules__[name] = impl;
+}
+  `.trim();
+}
+```
+
+### Building a Universal Storage Adapter
+
+```javascript
+// UNSTORAGE-STYLE DRIVER SYSTEM
+
+class StorageDriver {
+  constructor(options = {}) {
+    this.options = options;
+  }
+  
+  // Required methods
+  async hasItem(key) { throw new Error('Not implemented'); }
+  async getItem(key) { throw new Error('Not implemented'); }
+  async setItem(key, value) { throw new Error('Not implemented'); }
+  async removeItem(key) { throw new Error('Not implemented'); }
+  async getKeys(base) { throw new Error('Not implemented'); }
+  async clear() { throw new Error('Not implemented'); }
+  
+  // Optional methods
+  async getMeta(key) { return {}; }
+  async setMeta(key, meta) {}
+}
+
+// Memory driver (works everywhere)
+class MemoryDriver extends StorageDriver {
+  constructor(options = {}) {
+    super(options);
+    this.data = new Map();
+    this.meta = new Map();
+  }
+  
+  async hasItem(key) {
+    return this.data.has(key);
+  }
+  
+  async getItem(key) {
+    return this.data.get(key) ?? null;
+  }
+  
+  async setItem(key, value) {
+    this.data.set(key, value);
+    this.meta.set(key, { mtime: Date.now() });
+  }
+  
+  async removeItem(key) {
+    this.data.delete(key);
+    this.meta.delete(key);
+  }
+  
+  async getKeys(base = '') {
+    return [...this.data.keys()].filter(k => k.startsWith(base));
+  }
+  
+  async clear() {
+    this.data.clear();
+    this.meta.clear();
+  }
+}
+
+// Cloudflare KV driver
+class CloudflareKVDriver extends StorageDriver {
+  constructor(options) {
+    super(options);
+    this.binding = options.binding; // KV namespace binding name
+  }
+  
+  getKV() {
+    // Access from Cloudflare env
+    return globalThis.__env__?.[this.binding];
+  }
+  
+  async hasItem(key) {
+    return (await this.getKV().get(key)) !== null;
+  }
+  
+  async getItem(key) {
+    const value = await this.getKV().get(key, 'text');
+    return value ? JSON.parse(value) : null;
+  }
+  
+  async setItem(key, value) {
+    await this.getKV().put(key, JSON.stringify(value), {
+      expirationTtl: this.options.ttl,
+    });
+  }
+  
+  async removeItem(key) {
+    await this.getKV().delete(key);
+  }
+  
+  async getKeys(base = '') {
+    const list = await this.getKV().list({ prefix: base });
+    return list.keys.map(k => k.name);
+  }
+}
+
+// Universal storage factory
+function createStorage(options = {}) {
+  const drivers = new Map();
+  
+  return {
+    // Mount driver at prefix
+    mount(prefix, driver) {
+      drivers.set(prefix, driver);
+    },
+    
+    // Get driver for key
+    getDriver(key) {
+      for (const [prefix, driver] of drivers) {
+        if (key.startsWith(prefix)) {
+          return { driver, key: key.slice(prefix.length) };
+        }
+      }
+      return { driver: drivers.get('') || new MemoryDriver(), key };
+    },
+    
+    // Unified interface
+    async getItem(key) {
+      const { driver, key: k } = this.getDriver(key);
+      return driver.getItem(k);
+    },
+    
+    async setItem(key, value, opts) {
+      const { driver, key: k } = this.getDriver(key);
+      return driver.setItem(k, value, opts);
+    },
+    
+    async removeItem(key) {
+      const { driver, key: k } = this.getDriver(key);
+      return driver.removeItem(k);
+    },
+  };
+}
+```
+
+### Implementing Cross-Runtime Crypto
+
+```javascript
+// WEB CRYPTO ABSTRACTION (UNCRYPTO-STYLE)
+
+// Universal crypto that works on Node, Deno, Bun, Edge
+const crypto = globalThis.crypto || (await import('node:crypto')).webcrypto;
+
+class UniversalCrypto {
+  // Random bytes
+  static getRandomBytes(length) {
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    return bytes;
+  }
+  
+  // Generate UUID
+  static randomUUID() {
+    return crypto.randomUUID();
+  }
+  
+  // Hash with SHA-256
+  static async sha256(data) {
+    const encoder = new TextEncoder();
+    const buffer = typeof data === 'string' ? encoder.encode(data) : data;
+    const hash = await crypto.subtle.digest('SHA-256', buffer);
+    return new Uint8Array(hash);
+  }
+  
+  // Hash to hex string
+  static async sha256Hex(data) {
+    const hash = await this.sha256(data);
+    return Array.from(hash)
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  
+  // HMAC signing
+  static async hmacSign(key, data) {
+    const encoder = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      encoder.encode(key),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    
+    const signature = await crypto.subtle.sign(
+      'HMAC',
+      keyMaterial,
+      encoder.encode(data)
+    );
+    
+    return new Uint8Array(signature);
+  }
+  
+  // AES-GCM encryption
+  static async encrypt(key, data) {
+    const encoder = new TextEncoder();
+    const iv = this.getRandomBytes(12);
+    
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      await this.sha256(key),
+      'AES-GCM',
+      false,
+      ['encrypt']
+    );
+    
+    const encrypted = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      keyMaterial,
+      encoder.encode(data)
+    );
+    
+    // Combine IV + encrypted data
+    const result = new Uint8Array(iv.length + encrypted.byteLength);
+    result.set(iv);
+    result.set(new Uint8Array(encrypted), iv.length);
+    
+    return result;
+  }
+  
+  // AES-GCM decryption
+  static async decrypt(key, encryptedData) {
+    const iv = encryptedData.slice(0, 12);
+    const data = encryptedData.slice(12);
+    
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      await this.sha256(key),
+      'AES-GCM',
+      false,
+      ['decrypt']
+    );
+    
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      keyMaterial,
+      data
+    );
+    
+    return new TextDecoder().decode(decrypted);
+  }
+}
+
+// Base64 URL encoding (works everywhere)
+function base64UrlEncode(data) {
+  const bytes = typeof data === 'string' 
+    ? new TextEncoder().encode(data) 
+    : data;
+  
+  const base64 = btoa(String.fromCharCode(...bytes));
+  return base64
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function base64UrlDecode(str) {
+  const base64 = str
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+  
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  
+  return bytes;
+}
+```
+
+### Building Universal Fetch Wrapper
+
+```javascript
+// OFETCH-STYLE UNIVERSAL FETCH
+
+function createFetch(defaults = {}) {
+  return async function $fetch(url, options = {}) {
+    const config = {
+      ...defaults,
+      ...options,
+      headers: {
+        ...defaults.headers,
+        ...options.headers,
+      },
+    };
+    
+    // Resolve URL
+    const resolvedUrl = config.baseURL 
+      ? new URL(url, config.baseURL).toString() 
+      : url;
+    
+    // Prepare request
+    const fetchOptions = {
+      method: config.method || 'GET',
+      headers: config.headers,
+      signal: config.signal,
+    };
+    
+    // Handle body
+    if (config.body !== undefined) {
+      if (typeof config.body === 'object' && 
+          !(config.body instanceof FormData) &&
+          !(config.body instanceof ReadableStream)) {
+        fetchOptions.body = JSON.stringify(config.body);
+        fetchOptions.headers['Content-Type'] = 'application/json';
+      } else {
+        fetchOptions.body = config.body;
+      }
+    }
+    
+    // Add query params
+    if (config.query) {
+      const separator = resolvedUrl.includes('?') ? '&' : '?';
+      const params = new URLSearchParams(config.query).toString();
+      url = resolvedUrl + separator + params;
+    }
+    
+    // Retry logic
+    const maxRetries = config.retry ?? 1;
+    let lastError;
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        // Interceptors - request
+        if (config.onRequest) {
+          await config.onRequest({ request: fetchOptions, options: config });
+        }
+        
+        const response = await fetch(resolvedUrl, fetchOptions);
+        
+        // Interceptors - response
+        if (config.onResponse) {
+          await config.onResponse({ response, options: config });
+        }
+        
+        // Handle errors
+        if (!response.ok) {
+          const error = new FetchError(response.statusText);
+          error.response = response;
+          error.status = response.status;
+          
+          if (config.onResponseError) {
+            await config.onResponseError({ error, response, options: config });
+          }
+          
+          throw error;
+        }
+        
+        // Parse response
+        const contentType = response.headers.get('content-type') || '';
+        
+        if (config.responseType === 'stream') {
+          return response.body;
+        }
+        
+        if (config.responseType === 'blob') {
+          return response.blob();
+        }
+        
+        if (config.responseType === 'arrayBuffer') {
+          return response.arrayBuffer();
+        }
+        
+        if (contentType.includes('application/json')) {
+          return response.json();
+        }
+        
+        return response.text();
+        
+      } catch (error) {
+        lastError = error;
+        
+        // Don't retry on certain errors
+        if (error.status && error.status < 500) {
+          throw error;
+        }
+        
+        // Wait before retry
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        }
+      }
+    }
+    
+    throw lastError;
+  };
+}
+
+class FetchError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'FetchError';
+  }
+}
+
+// Create default instance
+const $fetch = createFetch();
+
+// Create with defaults
+const api = createFetch({
+  baseURL: 'https://api.example.com',
+  headers: {
+    'Authorization': 'Bearer token',
+  },
+  retry: 2,
+});
+```
+
 ## Related Skills
 
 - See [meta-frameworks-overview](../meta-frameworks-overview/SKILL.md) for framework deployment options

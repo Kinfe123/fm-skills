@@ -960,6 +960,530 @@ START: What UI library does your team know?
         Interactive app → Qwik (resumable, no hydration)
 ```
 
+---
+
+## For Framework Authors: Building Meta-Frameworks
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building meta-frameworks. Meta-framework architecture varies significantly—Next.js tightly integrates with React, Nuxt builds on Vue's ecosystem, and Astro is UI-agnostic. The direction shown here provides foundational architecture that most meta-frameworks share. Your implementation will depend on your target UI framework, deployment strategy, and the developer experience you want to provide.
+
+### Core Meta-Framework Architecture
+
+```javascript
+// META-FRAMEWORK CORE ARCHITECTURE
+
+class MetaFramework {
+  constructor(config) {
+    this.config = config;
+    this.plugins = [];
+    this.hooks = new HookSystem();
+    this.router = new FileBasedRouter();
+    this.bundler = new Bundler();
+    this.renderer = new UniversalRenderer();
+  }
+  
+  // Plugin system
+  use(plugin) {
+    this.plugins.push(plugin);
+    plugin.install?.(this);
+  }
+  
+  // Development server
+  async dev() {
+    await this.hooks.call('beforeDev');
+    
+    // Scan routes
+    const routes = await this.router.scan(this.config.pagesDir);
+    
+    // Start HMR bundler
+    await this.bundler.startDev({
+      routes,
+      onUpdate: (updates) => this.handleHMR(updates),
+    });
+    
+    // Start dev server
+    const server = await this.createDevServer(routes);
+    
+    await this.hooks.call('afterDev', { server });
+  }
+  
+  // Production build
+  async build() {
+    await this.hooks.call('beforeBuild');
+    
+    const routes = await this.router.scan(this.config.pagesDir);
+    
+    // Client build
+    const clientManifest = await this.bundler.buildClient(routes);
+    
+    // Server build  
+    const serverManifest = await this.bundler.buildServer(routes);
+    
+    // Static generation
+    await this.generateStatic(routes, { clientManifest, serverManifest });
+    
+    // Generate deployment artifacts
+    await this.adapter.generate(this.config);
+    
+    await this.hooks.call('afterBuild');
+  }
+}
+
+// Hook system for extensibility
+class HookSystem {
+  constructor() {
+    this.hooks = new Map();
+  }
+  
+  on(name, handler) {
+    if (!this.hooks.has(name)) {
+      this.hooks.set(name, []);
+    }
+    this.hooks.get(name).push(handler);
+  }
+  
+  async call(name, context = {}) {
+    const handlers = this.hooks.get(name) || [];
+    for (const handler of handlers) {
+      await handler(context);
+    }
+  }
+}
+```
+
+### Building the Plugin System
+
+```javascript
+// PLUGIN SYSTEM IMPLEMENTATION
+
+class PluginManager {
+  constructor(framework) {
+    this.framework = framework;
+    this.plugins = [];
+  }
+  
+  async register(plugin) {
+    // Validate plugin
+    if (!plugin.name) {
+      throw new Error('Plugin must have a name');
+    }
+    
+    // Check dependencies
+    for (const dep of plugin.dependencies || []) {
+      if (!this.plugins.find(p => p.name === dep)) {
+        throw new Error(`Plugin ${plugin.name} requires ${dep}`);
+      }
+    }
+    
+    // Initialize plugin
+    const instance = await plugin.setup?.(this.framework) || {};
+    
+    // Register hooks
+    if (plugin.hooks) {
+      for (const [hook, handler] of Object.entries(plugin.hooks)) {
+        this.framework.hooks.on(hook, handler.bind(instance));
+      }
+    }
+    
+    // Add Vite plugins
+    if (plugin.vitePlugins) {
+      this.framework.bundler.addPlugins(plugin.vitePlugins);
+    }
+    
+    this.plugins.push({ ...plugin, instance });
+  }
+}
+
+// Example plugin
+const imageOptimizationPlugin = {
+  name: 'image-optimization',
+  
+  async setup(framework) {
+    return {
+      cache: new Map(),
+    };
+  },
+  
+  hooks: {
+    async beforeBuild() {
+      console.log('Preparing image optimization...');
+    },
+    
+    async transformAsset(context) {
+      if (!isImage(context.path)) return;
+      
+      const optimized = await optimizeImage(context.content, {
+        quality: 80,
+        formats: ['webp', 'avif'],
+      });
+      
+      return optimized;
+    },
+  },
+  
+  vitePlugins: [
+    {
+      name: 'vite-plugin-images',
+      transform(code, id) {
+        if (id.endsWith('.jpg') || id.endsWith('.png')) {
+          // Transform image imports
+        }
+      },
+    },
+  ],
+};
+```
+
+### Implementing Adapters (Deploy Anywhere)
+
+```javascript
+// ADAPTER SYSTEM IMPLEMENTATION
+
+class AdapterManager {
+  constructor() {
+    this.adapters = new Map();
+  }
+  
+  register(name, adapter) {
+    this.adapters.set(name, adapter);
+  }
+  
+  async build(adapterName, context) {
+    const adapter = this.adapters.get(adapterName);
+    if (!adapter) {
+      throw new Error(`Unknown adapter: ${adapterName}`);
+    }
+    
+    return adapter.adapt(context);
+  }
+}
+
+// Node.js adapter
+const nodeAdapter = {
+  name: 'node',
+  
+  async adapt(context) {
+    const { serverEntry, staticDir, outputDir } = context;
+    
+    // Generate Node.js server
+    const serverCode = `
+import { createServer } from 'http';
+import { handler } from './handler.js';
+
+const server = createServer(async (req, res) => {
+  const response = await handler(req);
+  res.writeHead(response.status, Object.fromEntries(response.headers));
+  res.end(response.body);
+});
+
+server.listen(process.env.PORT || 3000);
+`;
+    
+    await fs.writeFile(`${outputDir}/index.js`, serverCode);
+    await fs.cp(staticDir, `${outputDir}/static`, { recursive: true });
+    
+    return { type: 'node', entry: 'index.js' };
+  },
+};
+
+// Cloudflare Workers adapter
+const cloudflareAdapter = {
+  name: 'cloudflare',
+  
+  async adapt(context) {
+    const { serverEntry, staticDir, outputDir } = context;
+    
+    // Generate Worker script
+    const workerCode = `
+import { handler } from './handler.js';
+
+export default {
+  async fetch(request, env, ctx) {
+    // Try static files first
+    const url = new URL(request.url);
+    const staticResponse = await env.ASSETS.fetch(request);
+    if (staticResponse.status !== 404) return staticResponse;
+    
+    // Fall back to SSR handler
+    return handler(request, env, ctx);
+  },
+};
+`;
+    
+    await fs.writeFile(`${outputDir}/_worker.js`, workerCode);
+    
+    // Generate wrangler.toml
+    const wranglerConfig = `
+name = "${context.config.name}"
+main = "_worker.js"
+compatibility_date = "2024-01-01"
+
+[site]
+bucket = "./static"
+`;
+    
+    await fs.writeFile(`${outputDir}/wrangler.toml`, wranglerConfig);
+    
+    return { type: 'cloudflare-workers' };
+  },
+};
+
+// Vercel adapter
+const vercelAdapter = {
+  name: 'vercel',
+  
+  async adapt(context) {
+    const { routes, serverEntry, staticDir, outputDir } = context;
+    
+    // Generate Vercel config
+    const vercelConfig = {
+      version: 3,
+      routes: [
+        // Static assets
+        { src: '/static/(.*)', dest: '/static/$1' },
+        // API routes
+        ...routes.filter(r => r.type === 'api').map(r => ({
+          src: r.path,
+          dest: `/api${r.path}`,
+        })),
+        // SSR routes
+        { src: '/(.*)', dest: '/render' },
+      ],
+      functions: {
+        'api/**/*.js': { runtime: 'nodejs20.x' },
+        'render.js': { runtime: 'nodejs20.x' },
+      },
+    };
+    
+    await fs.writeFile(
+      `${outputDir}/vercel.json`, 
+      JSON.stringify(vercelConfig, null, 2)
+    );
+    
+    // Generate serverless functions
+    for (const route of routes) {
+      if (route.type === 'api') {
+        await generateAPIFunction(route, outputDir);
+      }
+    }
+    
+    // Generate SSR function
+    await generateSSRFunction(context, outputDir);
+    
+    return { type: 'vercel' };
+  },
+};
+```
+
+### Server Component Architecture
+
+```javascript
+// SERVER COMPONENT IMPLEMENTATION
+
+class ServerComponentRuntime {
+  constructor() {
+    this.componentCache = new Map();
+    this.clientReferences = new Map();
+  }
+  
+  // Mark component as client boundary
+  registerClientReference(id, exportName) {
+    this.clientReferences.set(`${id}#${exportName}`, {
+      id,
+      exportName,
+      chunks: [], // Filled during build
+    });
+  }
+  
+  // Render server component to RSC payload
+  async renderToPayload(element, context) {
+    const payload = [];
+    await this.walkTree(element, payload, context);
+    return payload;
+  }
+  
+  async walkTree(element, payload, context) {
+    if (!element) return null;
+    
+    // Primitive values
+    if (typeof element !== 'object') {
+      return element;
+    }
+    
+    // Array of children
+    if (Array.isArray(element)) {
+      return Promise.all(element.map(e => this.walkTree(e, payload, context)));
+    }
+    
+    const { type, props } = element;
+    
+    // HTML element
+    if (typeof type === 'string') {
+      return {
+        $$typeof: Symbol.for('react.element'),
+        type,
+        props: {
+          ...props,
+          children: await this.walkTree(props.children, payload, context),
+        },
+      };
+    }
+    
+    // Client component reference
+    if (this.clientReferences.has(type.$$id)) {
+      const ref = this.clientReferences.get(type.$$id);
+      return {
+        $$typeof: Symbol.for('react.client.reference'),
+        $$id: ref.id,
+        $$name: ref.exportName,
+        props: await this.serializeProps(props),
+      };
+    }
+    
+    // Server component - execute
+    const result = await type(props);
+    return this.walkTree(result, payload, context);
+  }
+  
+  // Serialize props for client
+  async serializeProps(props) {
+    const serialized = {};
+    
+    for (const [key, value] of Object.entries(props)) {
+      if (typeof value === 'function') {
+        // Server actions become references
+        serialized[key] = {
+          $$typeof: Symbol.for('react.server.reference'),
+          $$id: registerServerAction(value),
+        };
+      } else {
+        serialized[key] = value;
+      }
+    }
+    
+    return serialized;
+  }
+}
+
+// Build-time transform for 'use client' directive
+function transformClientDirective(code, id) {
+  if (!code.startsWith("'use client'") && !code.startsWith('"use client"')) {
+    return null;
+  }
+  
+  // Parse exports
+  const exports = parseExports(code);
+  
+  // Generate proxy module for server
+  const serverProxy = exports.map(exp => 
+    `export const ${exp} = { $$id: "${id}#${exp}", $$typeof: Symbol.for('react.client.reference') };`
+  ).join('\n');
+  
+  return serverProxy;
+}
+```
+
+### Build Pipeline Orchestration
+
+```javascript
+// BUILD PIPELINE ORCHESTRATION
+
+class BuildPipeline {
+  constructor(config) {
+    this.config = config;
+    this.steps = [];
+  }
+  
+  addStep(step) {
+    this.steps.push(step);
+  }
+  
+  async run() {
+    const context = {
+      config: this.config,
+      routes: [],
+      assets: new Map(),
+      manifest: {},
+    };
+    
+    for (const step of this.steps) {
+      console.log(`[build] ${step.name}...`);
+      const start = Date.now();
+      
+      try {
+        await step.execute(context);
+        console.log(`[build] ${step.name} (${Date.now() - start}ms)`);
+      } catch (error) {
+        console.error(`[build] ${step.name} failed:`, error);
+        throw error;
+      }
+    }
+    
+    return context;
+  }
+}
+
+// Standard build steps
+const buildSteps = [
+  {
+    name: 'scan-routes',
+    async execute(ctx) {
+      ctx.routes = await scanRoutes(ctx.config.pagesDir);
+    },
+  },
+  {
+    name: 'bundle-client',
+    async execute(ctx) {
+      ctx.clientBuild = await bundleClient({
+        routes: ctx.routes,
+        outDir: `${ctx.config.outDir}/client`,
+      });
+    },
+  },
+  {
+    name: 'bundle-server',
+    async execute(ctx) {
+      ctx.serverBuild = await bundleServer({
+        routes: ctx.routes,
+        outDir: `${ctx.config.outDir}/server`,
+      });
+    },
+  },
+  {
+    name: 'prerender-static',
+    async execute(ctx) {
+      const staticRoutes = ctx.routes.filter(r => !r.isDynamic);
+      await Promise.all(staticRoutes.map(r => prerenderRoute(r, ctx)));
+    },
+  },
+  {
+    name: 'generate-manifest',
+    async execute(ctx) {
+      ctx.manifest = {
+        routes: ctx.routes.map(r => ({
+          path: r.path,
+          type: r.type,
+          prerendered: r.prerendered,
+        })),
+        assets: Object.fromEntries(ctx.assets),
+        buildId: Date.now().toString(36),
+      };
+      
+      await fs.writeFile(
+        `${ctx.config.outDir}/manifest.json`,
+        JSON.stringify(ctx.manifest, null, 2)
+      );
+    },
+  },
+  {
+    name: 'adapt',
+    async execute(ctx) {
+      const adapter = getAdapter(ctx.config.adapter);
+      await adapter.adapt(ctx);
+    },
+  },
+];
+```
+
 ## Related Skills
 
 - See [web-app-architectures](../web-app-architectures/SKILL.md) for SPA vs MPA

@@ -535,6 +535,418 @@ If JS fails (network error, parsing error, old browser), SPA shows nothing.
 - Performance is critical for both initial and subsequent loads
 - You want the best of both worlds (most modern apps)
 
+---
+
+## For Framework Authors: Building Web Architectures
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building these systems. There are many valid ways to implement web architectures—the direction shown here is based on patterns used by popular frameworks like React Router, Vue Router, and Astro. Use these as a starting point and adapt based on your framework's specific requirements, constraints, and design philosophy.
+
+### Implementing a Minimal SPA Router
+
+If you're building a framework, here's how to implement client-side routing:
+
+```javascript
+// MINIMAL SPA ROUTER IMPLEMENTATION
+
+class Router {
+  constructor() {
+    this.routes = new Map();
+    this.currentRoute = null;
+    this.outlet = null;
+    
+    // Listen for browser back/forward
+    window.addEventListener('popstate', () => this.handleNavigation());
+    
+    // Intercept link clicks
+    document.addEventListener('click', (e) => {
+      const link = e.target.closest('a');
+      if (link && link.href.startsWith(location.origin)) {
+        e.preventDefault();
+        this.navigate(link.pathname);
+      }
+    });
+  }
+  
+  // Register a route with pattern and handler
+  route(pattern, handler) {
+    // Convert /users/:id to regex with named groups
+    const paramNames = [];
+    const regexPattern = pattern.replace(/:([^/]+)/g, (_, name) => {
+      paramNames.push(name);
+      return '([^/]+)';
+    });
+    
+    this.routes.set(new RegExp(`^${regexPattern}$`), {
+      handler,
+      paramNames,
+    });
+  }
+  
+  // Programmatic navigation
+  navigate(path, { replace = false } = {}) {
+    if (replace) {
+      history.replaceState({ path }, '', path);
+    } else {
+      history.pushState({ path }, '', path);
+    }
+    this.handleNavigation();
+  }
+  
+  // Match current URL and render
+  async handleNavigation() {
+    const path = location.pathname;
+    
+    for (const [regex, { handler, paramNames }] of this.routes) {
+      const match = path.match(regex);
+      if (match) {
+        // Extract route params
+        const params = {};
+        paramNames.forEach((name, i) => {
+          params[name] = match[i + 1];
+        });
+        
+        // Call route handler
+        const content = await handler({ params, path });
+        
+        // Render to outlet
+        if (this.outlet) {
+          this.outlet.innerHTML = '';
+          this.outlet.appendChild(content);
+        }
+        return;
+      }
+    }
+    
+    // 404 handling
+    console.error('No route matched:', path);
+  }
+  
+  // Set render target
+  mount(element) {
+    this.outlet = element;
+    this.handleNavigation();
+  }
+}
+
+// Usage
+const router = new Router();
+router.route('/', () => createElement('h1', 'Home'));
+router.route('/users/:id', ({ params }) => 
+  createElement('h1', `User ${params.id}`)
+);
+router.mount(document.getElementById('app'));
+```
+
+### Building a File-Based Router (Build Time)
+
+Meta-frameworks use file system as routing config:
+
+```javascript
+// FILE-BASED ROUTING IMPLEMENTATION (build tool)
+
+import { glob } from 'glob';
+import path from 'path';
+
+function generateRoutes(pagesDir) {
+  // Find all page files
+  const files = glob.sync('**/*.{js,jsx,ts,tsx}', { cwd: pagesDir });
+  
+  const routes = files.map(file => {
+    // Remove extension
+    let route = file.replace(/\.(js|jsx|ts|tsx)$/, '');
+    
+    // Handle index files
+    route = route.replace(/\/index$/, '') || '/';
+    
+    // Convert [param] to :param
+    route = route.replace(/\[([^\]]+)\]/g, ':$1');
+    
+    // Convert [...slug] to *
+    route = route.replace(/\[\.\.\.([^\]]+)\]/g, '*');
+    
+    return {
+      path: '/' + route,
+      component: path.join(pagesDir, file),
+      // Generate regex for matching
+      regex: pathToRegex('/' + route),
+    };
+  });
+  
+  // Sort routes: static before dynamic, specific before catch-all
+  return routes.sort((a, b) => {
+    const aScore = routeScore(a.path);
+    const bScore = routeScore(b.path);
+    return bScore - aScore;
+  });
+}
+
+function routeScore(path) {
+  let score = 0;
+  // Static segments are worth more
+  const segments = path.split('/').filter(Boolean);
+  for (const seg of segments) {
+    if (seg.startsWith(':')) score += 1;      // Dynamic: low
+    else if (seg === '*') score += 0;          // Catch-all: lowest
+    else score += 10;                          // Static: high
+  }
+  return score;
+}
+
+// Generate route manifest at build time
+const routes = generateRoutes('./src/pages');
+writeFileSync('./dist/routes.json', JSON.stringify(routes, null, 2));
+```
+
+### Implementing Nested Layouts
+
+Layouts require component composition:
+
+```javascript
+// NESTED LAYOUT SYSTEM
+
+// Layout discovery at build time
+function buildLayoutTree(routePath, pagesDir) {
+  const segments = routePath.split('/').filter(Boolean);
+  const layouts = [];
+  
+  // Walk up the tree finding layouts
+  let currentPath = pagesDir;
+  
+  // Check root layout
+  if (existsSync(path.join(currentPath, '_layout.tsx'))) {
+    layouts.push(path.join(currentPath, '_layout.tsx'));
+  }
+  
+  // Check each segment
+  for (const segment of segments) {
+    currentPath = path.join(currentPath, segment);
+    if (existsSync(path.join(currentPath, '_layout.tsx'))) {
+      layouts.push(path.join(currentPath, '_layout.tsx'));
+    }
+  }
+  
+  return layouts;  // Ordered from root to leaf
+}
+
+// Runtime rendering with layouts
+async function renderWithLayouts(layouts, pageComponent, props) {
+  // Start from innermost (page) and wrap outward
+  let content = await pageComponent(props);
+  
+  // Wrap with each layout, inside-out
+  for (let i = layouts.length - 1; i >= 0; i--) {
+    const Layout = await import(layouts[i]);
+    content = await Layout.default({ children: content, ...props });
+  }
+  
+  return content;
+}
+```
+
+### State Preservation Across Navigation
+
+SPAs must preserve state during navigation:
+
+```javascript
+// STATE PRESERVATION STRATEGIES
+
+class NavigationStateManager {
+  constructor() {
+    this.componentStates = new Map();
+    this.scrollPositions = new Map();
+  }
+  
+  // Save state before navigation
+  saveState(routeKey, componentTree) {
+    // Serialize component state
+    const state = this.extractState(componentTree);
+    this.componentStates.set(routeKey, state);
+    
+    // Save scroll position
+    this.scrollPositions.set(routeKey, {
+      x: window.scrollX,
+      y: window.scrollY,
+    });
+  }
+  
+  // Restore state after navigation
+  restoreState(routeKey) {
+    const state = this.componentStates.get(routeKey);
+    const scroll = this.scrollPositions.get(routeKey);
+    
+    return { state, scroll };
+  }
+  
+  // Extract serializable state from component tree
+  extractState(tree) {
+    // Framework-specific: walk component tree
+    // Extract useState values, refs, etc.
+    // Must handle circular references
+  }
+}
+
+// Integration with router
+router.beforeNavigate((from, to) => {
+  stateManager.saveState(from.path, currentComponentTree);
+});
+
+router.afterNavigate((to) => {
+  const { state, scroll } = stateManager.restoreState(to.path);
+  if (state) {
+    restoreComponentState(state);
+  }
+  if (scroll) {
+    window.scrollTo(scroll.x, scroll.y);
+  }
+});
+```
+
+### Memory Management for Long-Running SPAs
+
+```javascript
+// MEMORY LEAK PREVENTION
+
+class ComponentRegistry {
+  constructor() {
+    this.mounted = new Set();
+    this.cleanupFns = new Map();
+  }
+  
+  mount(component, cleanup) {
+    this.mounted.add(component);
+    if (cleanup) {
+      this.cleanupFns.set(component, cleanup);
+    }
+  }
+  
+  unmount(component) {
+    // Run cleanup functions
+    const cleanup = this.cleanupFns.get(component);
+    if (cleanup) {
+      cleanup();
+      this.cleanupFns.delete(component);
+    }
+    
+    this.mounted.delete(component);
+  }
+  
+  // Called on route change
+  unmountRoute(routeComponents) {
+    for (const component of routeComponents) {
+      this.unmount(component);
+    }
+    
+    // Force garbage collection hint
+    if (global.gc) global.gc();
+  }
+}
+
+// Event listener cleanup pattern
+class EventManager {
+  constructor() {
+    this.listeners = new WeakMap();
+  }
+  
+  addListener(element, event, handler) {
+    element.addEventListener(event, handler);
+    
+    // Track for cleanup
+    if (!this.listeners.has(element)) {
+      this.listeners.set(element, []);
+    }
+    this.listeners.get(element).push({ event, handler });
+  }
+  
+  removeAllListeners(element) {
+    const handlers = this.listeners.get(element);
+    if (handlers) {
+      for (const { event, handler } of handlers) {
+        element.removeEventListener(event, handler);
+      }
+      this.listeners.delete(element);
+    }
+  }
+}
+```
+
+### Building MPA with Partial Hydration
+
+```javascript
+// PARTIAL HYDRATION IMPLEMENTATION
+
+// 1. Mark interactive components at build time
+// <Button client:load>Click me</Button>
+
+// 2. Extract islands during SSR
+function extractIslands(html, components) {
+  const islands = [];
+  
+  // Find island markers in HTML
+  const regex = /<island-(\w+) props="([^"]+)">/g;
+  let match;
+  
+  while ((match = regex.exec(html)) !== null) {
+    islands.push({
+      id: match[1],
+      props: JSON.parse(decodeURIComponent(match[2])),
+      component: components[match[1]],
+    });
+  }
+  
+  return islands;
+}
+
+// 3. Hydrate only islands on client
+function hydrateIslands(islands) {
+  for (const island of islands) {
+    const element = document.querySelector(`[data-island="${island.id}"]`);
+    if (element) {
+      // Load component code
+      const Component = await import(island.component);
+      
+      // Hydrate this specific element
+      hydrateRoot(element, <Component {...island.props} />);
+    }
+  }
+}
+
+// 4. Island web component wrapper
+class IslandElement extends HTMLElement {
+  async connectedCallback() {
+    // Defer hydration based on strategy
+    const strategy = this.getAttribute('client');
+    
+    switch (strategy) {
+      case 'load':
+        await this.hydrate();
+        break;
+      case 'idle':
+        requestIdleCallback(() => this.hydrate());
+        break;
+      case 'visible':
+        const observer = new IntersectionObserver(async ([entry]) => {
+          if (entry.isIntersecting) {
+            observer.disconnect();
+            await this.hydrate();
+          }
+        });
+        observer.observe(this);
+        break;
+    }
+  }
+  
+  async hydrate() {
+    const component = this.getAttribute('component');
+    const props = JSON.parse(this.getAttribute('props') || '{}');
+    
+    const Component = await import(`/components/${component}.js`);
+    hydrateRoot(this, createElement(Component.default, props));
+  }
+}
+
+customElements.define('island-component', IslandElement);
+```
+
 ## Related Skills
 
 - See [rendering-patterns](../rendering-patterns/SKILL.md) for SSR, SSG, CSR, ISR

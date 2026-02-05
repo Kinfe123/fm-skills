@@ -806,6 +806,417 @@ function AddToCartButton({ productId }) {
 }
 ```
 
+---
+
+## For Framework Authors: Building Hydration Systems
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building hydration systems. Hydration is one of the most complex areas in framework development with many valid strategies—from React's reconciliation-based approach to Qwik's resumability to Astro's islands. The direction shown here provides foundational concepts; adapt these patterns based on your framework's rendering model, state management, and performance priorities.
+
+### Implementing Basic Hydration
+
+```javascript
+// MINIMAL HYDRATION IMPLEMENTATION
+
+function hydrateRoot(container, element) {
+  // Get existing DOM nodes
+  const existingNodes = Array.from(container.childNodes);
+  
+  // Walk virtual tree and existing DOM in parallel
+  hydrateNode(element, existingNodes[0], container);
+}
+
+function hydrateNode(vnode, domNode, parent) {
+  if (typeof vnode === 'string' || typeof vnode === 'number') {
+    // Text node - validate match
+    if (domNode?.nodeType === Node.TEXT_NODE) {
+      if (domNode.textContent !== String(vnode)) {
+        console.warn('Hydration mismatch:', domNode.textContent, '!=', vnode);
+        domNode.textContent = vnode;
+      }
+    }
+    return domNode;
+  }
+  
+  if (!vnode) return null;
+  
+  const { type, props } = vnode;
+  
+  // Function component - call and hydrate result
+  if (typeof type === 'function') {
+    const result = type(props);
+    return hydrateNode(result, domNode, parent);
+  }
+  
+  // Element node - validate and attach listeners
+  if (domNode?.nodeName?.toLowerCase() !== type) {
+    console.error('Hydration mismatch: expected', type, 'got', domNode?.nodeName);
+    // Full re-render fallback
+    const newNode = render(vnode);
+    parent.replaceChild(newNode, domNode);
+    return newNode;
+  }
+  
+  // Attach event listeners (not present in SSR HTML)
+  attachEventListeners(domNode, props);
+  
+  // Hydrate children
+  const children = Array.isArray(props.children) 
+    ? props.children 
+    : props.children ? [props.children] : [];
+  const domChildren = Array.from(domNode.childNodes);
+  
+  children.forEach((child, i) => {
+    hydrateNode(child, domChildren[i], domNode);
+  });
+  
+  return domNode;
+}
+
+function attachEventListeners(element, props) {
+  Object.entries(props).forEach(([key, value]) => {
+    if (key.startsWith('on') && typeof value === 'function') {
+      const eventName = key.slice(2).toLowerCase();
+      element.addEventListener(eventName, value);
+    }
+  });
+}
+```
+
+### Building a Hydration Scheduler
+
+```javascript
+// PROGRESSIVE HYDRATION SCHEDULER
+
+class HydrationScheduler {
+  constructor() {
+    this.queue = [];
+    this.isHydrating = false;
+    this.idleDeadline = 50; // ms per frame
+  }
+  
+  // Add component to hydration queue
+  schedule(component, priority = 'normal') {
+    this.queue.push({ component, priority });
+    this.sortQueue();
+    this.processQueue();
+  }
+  
+  sortQueue() {
+    const priorityOrder = { critical: 0, high: 1, normal: 2, low: 3 };
+    this.queue.sort((a, b) => 
+      priorityOrder[a.priority] - priorityOrder[b.priority]
+    );
+  }
+  
+  processQueue() {
+    if (this.isHydrating || this.queue.length === 0) return;
+    
+    this.isHydrating = true;
+    
+    requestIdleCallback((deadline) => {
+      while (
+        this.queue.length > 0 && 
+        (deadline.timeRemaining() > 0 || deadline.didTimeout)
+      ) {
+        const { component } = this.queue.shift();
+        this.hydrateComponent(component);
+      }
+      
+      this.isHydrating = false;
+      
+      if (this.queue.length > 0) {
+        this.processQueue();
+      }
+    }, { timeout: 1000 });
+  }
+  
+  hydrateComponent(component) {
+    const element = document.querySelector(
+      `[data-hydrate="${component.id}"]`
+    );
+    if (element) {
+      hydrateRoot(element, component.vnode);
+    }
+  }
+}
+
+// Visibility-based hydration trigger
+class VisibilityHydration {
+  constructor(scheduler) {
+    this.scheduler = scheduler;
+    this.observer = new IntersectionObserver(
+      (entries) => this.onIntersect(entries),
+      { rootMargin: '200px' }
+    );
+  }
+  
+  observe(element, component) {
+    element.__component = component;
+    this.observer.observe(element);
+  }
+  
+  onIntersect(entries) {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        this.observer.unobserve(entry.target);
+        this.scheduler.schedule(entry.target.__component, 'high');
+      }
+    });
+  }
+}
+```
+
+### Implementing Resumability (Qwik-style)
+
+```javascript
+// RESUMABILITY IMPLEMENTATION
+
+// Server-side: Serialize component state and handlers
+function serializeComponent(component, props) {
+  const handlers = {};
+  const state = {};
+  
+  // Extract and serialize event handlers
+  Object.entries(props).forEach(([key, value]) => {
+    if (key.startsWith('on') && typeof value === 'function') {
+      // Serialize handler reference
+      const handlerId = generateHandlerId(value);
+      handlers[key] = handlerId;
+      
+      // Store handler code location for lazy loading
+      registerHandler(handlerId, {
+        module: component.__module,
+        export: value.name,
+      });
+    } else {
+      state[key] = value;
+    }
+  });
+  
+  return {
+    html: renderToString(component, props),
+    stateScript: `<script type="qwik/json">${JSON.stringify({
+      state,
+      handlers,
+    })}</script>`,
+  };
+}
+
+// Client-side: Resume without re-executing
+function resume() {
+  // Parse serialized state
+  const stateScript = document.querySelector('script[type="qwik/json"]');
+  const { state, handlers } = JSON.parse(stateScript.textContent);
+  
+  // Attach global event listener (event delegation)
+  document.addEventListener('click', async (event) => {
+    const target = event.target.closest('[on\\:click]');
+    if (!target) return;
+    
+    const handlerId = target.getAttribute('on:click');
+    const handlerInfo = getHandler(handlerId);
+    
+    // Lazy load handler module
+    const module = await import(handlerInfo.module);
+    const handler = module[handlerInfo.export];
+    
+    // Execute with serialized state
+    handler(event, state);
+  });
+}
+
+// Emit resumable HTML
+function renderResumable(component, props) {
+  const { html, stateScript } = serializeComponent(component, props);
+  
+  return `
+    ${html}
+    ${stateScript}
+    <script src="/qwik-loader.js" async></script>
+  `;
+}
+```
+
+### Building Islands Architecture
+
+```javascript
+// ISLANDS ARCHITECTURE IMPLEMENTATION
+
+// Build-time: Analyze component for interactivity
+function analyzeComponent(component, ast) {
+  return {
+    hasState: astContains(ast, 'useState', 'useSignal', 'createSignal'),
+    hasEffects: astContains(ast, 'useEffect', 'onMount'),
+    hasHandlers: astContains(ast, /^on[A-Z]/),
+    imports: extractImports(ast),
+  };
+}
+
+// Build-time: Mark islands in HTML
+function markIslands(html, components) {
+  return html.replace(
+    /<([A-Z]\w+)([^>]*)client:(\w+)([^>]*)>/g,
+    (match, name, before, strategy, after) => {
+      const component = components[name];
+      const props = extractProps(before + after);
+      
+      return `<astro-island 
+        component-url="${component.url}"
+        component-export="${component.export}"
+        renderer-url="${component.renderer}"
+        props="${encodeProps(props)}"
+        client="${strategy}"
+        ${before}${after}>`;
+    }
+  );
+}
+
+// Client-side: Island loader
+class AstroIsland extends HTMLElement {
+  async connectedCallback() {
+    const strategy = this.getAttribute('client');
+    
+    switch (strategy) {
+      case 'load':
+        await this.hydrate();
+        break;
+        
+      case 'idle':
+        if ('requestIdleCallback' in window) {
+          requestIdleCallback(() => this.hydrate());
+        } else {
+          setTimeout(() => this.hydrate(), 200);
+        }
+        break;
+        
+      case 'visible':
+        const observer = new IntersectionObserver(async ([entry]) => {
+          if (entry.isIntersecting) {
+            observer.disconnect();
+            await this.hydrate();
+          }
+        });
+        observer.observe(this);
+        break;
+        
+      case 'media':
+        const query = this.getAttribute('client-media');
+        const mq = window.matchMedia(query);
+        if (mq.matches) {
+          await this.hydrate();
+        } else {
+          mq.addEventListener('change', () => this.hydrate(), { once: true });
+        }
+        break;
+    }
+  }
+  
+  async hydrate() {
+    // Load component and renderer
+    const [Component, { default: render }] = await Promise.all([
+      import(this.getAttribute('component-url')),
+      import(this.getAttribute('renderer-url')),
+    ]);
+    
+    const props = JSON.parse(
+      decodeURIComponent(this.getAttribute('props'))
+    );
+    const exportName = this.getAttribute('component-export');
+    
+    // Hydrate with framework-specific renderer
+    await render(
+      this,
+      Component[exportName],
+      props,
+      this.innerHTML
+    );
+  }
+}
+
+customElements.define('astro-island', AstroIsland);
+```
+
+### State Serialization for Hydration
+
+```javascript
+// STATE SERIALIZATION SYSTEM
+
+class StateSerializer {
+  constructor() {
+    this.stateMap = new Map();
+    this.counter = 0;
+  }
+  
+  // During SSR: capture state
+  captureState(componentId, state) {
+    this.stateMap.set(componentId, this.serialize(state));
+  }
+  
+  serialize(value) {
+    if (value === null || value === undefined) return value;
+    if (typeof value === 'function') return undefined; // Can't serialize
+    if (value instanceof Date) return { __type: 'Date', value: value.toISOString() };
+    if (value instanceof Map) return { __type: 'Map', value: Array.from(value) };
+    if (value instanceof Set) return { __type: 'Set', value: Array.from(value) };
+    if (ArrayBuffer.isView(value)) {
+      return { __type: 'TypedArray', ctor: value.constructor.name, value: Array.from(value) };
+    }
+    if (Array.isArray(value)) return value.map(v => this.serialize(v));
+    if (typeof value === 'object') {
+      const result = {};
+      for (const [k, v] of Object.entries(value)) {
+        result[k] = this.serialize(v);
+      }
+      return result;
+    }
+    return value;
+  }
+  
+  // Emit script tag with serialized state
+  emit() {
+    const data = Object.fromEntries(this.stateMap);
+    return `<script id="__HYDRATION_STATE__" type="application/json">${
+      JSON.stringify(data).replace(/</g, '\\u003c')
+    }</script>`;
+  }
+}
+
+// Client-side: restore state
+function restoreState() {
+  const script = document.getElementById('__HYDRATION_STATE__');
+  if (!script) return new Map();
+  
+  const data = JSON.parse(script.textContent);
+  const stateMap = new Map();
+  
+  for (const [id, serialized] of Object.entries(data)) {
+    stateMap.set(id, deserialize(serialized));
+  }
+  
+  return stateMap;
+}
+
+function deserialize(value) {
+  if (value === null || value === undefined) return value;
+  if (value?.__type === 'Date') return new Date(value.value);
+  if (value?.__type === 'Map') return new Map(value.value);
+  if (value?.__type === 'Set') return new Set(value.value);
+  if (value?.__type === 'TypedArray') {
+    const Ctor = globalThis[value.ctor];
+    return new Ctor(value.value);
+  }
+  if (Array.isArray(value)) return value.map(deserialize);
+  if (typeof value === 'object') {
+    const result = {};
+    for (const [k, v] of Object.entries(value)) {
+      result[k] = deserialize(v);
+    }
+    return result;
+  }
+  return value;
+}
+```
+
 ## Related Skills
 
 - See [rendering-patterns](../rendering-patterns/SKILL.md) for SSR/SSG context

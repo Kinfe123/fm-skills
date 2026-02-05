@@ -1639,6 +1639,466 @@ FORMATTING:
 └─► Future: Oxc prettier (planned)
 ```
 
+---
+
+## For Framework Authors: Building Bundler Integrations
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building bundler integrations. Plugin APIs differ across bundlers—Rollup/Vite use a hook-based system, Webpack uses tapable, and esbuild has a simpler API. The direction shown here focuses on the Rollup/Vite pattern (most common for modern frameworks). Adapt based on which bundlers you need to support and whether you're building plugins or a custom bundler.
+
+### Writing Bundler Plugins
+
+```javascript
+// VITE/ROLLUP PLUGIN STRUCTURE
+
+function myPlugin(options = {}) {
+  return {
+    name: 'my-plugin',
+    
+    // Called when config is resolved
+    configResolved(config) {
+      this.config = config;
+    },
+    
+    // Transform source code
+    transform(code, id) {
+      if (!id.endsWith('.special')) return null;
+      
+      // Transform the code
+      const transformed = processSpecialFile(code);
+      
+      return {
+        code: transformed,
+        map: null, // Source map
+      };
+    },
+    
+    // Resolve import paths
+    resolveId(source, importer) {
+      if (source.startsWith('virtual:')) {
+        return '\0' + source; // Prefix with \0 for virtual modules
+      }
+      return null; // Let other plugins handle
+    },
+    
+    // Load virtual modules
+    load(id) {
+      if (id.startsWith('\0virtual:')) {
+        return `export default ${JSON.stringify(getVirtualContent(id))}`;
+      }
+      return null;
+    },
+    
+    // Build hooks
+    buildStart() {
+      console.log('Build starting...');
+    },
+    
+    buildEnd(error) {
+      if (error) console.error('Build failed:', error);
+    },
+    
+    // Generate bundle output
+    generateBundle(options, bundle) {
+      // Modify or add to bundle
+      this.emitFile({
+        type: 'asset',
+        fileName: 'manifest.json',
+        source: JSON.stringify(generateManifest(bundle)),
+      });
+    },
+  };
+}
+
+// Vite-specific hooks
+function vitePlugin() {
+  return {
+    name: 'vite-specific',
+    
+    // Dev server middleware
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        if (req.url === '/__my-plugin') {
+          res.end(JSON.stringify({ status: 'ok' }));
+          return;
+        }
+        next();
+      });
+    },
+    
+    // HMR handling
+    handleHotUpdate({ file, server, modules }) {
+      if (file.endsWith('.custom')) {
+        // Custom HMR logic
+        server.ws.send({
+          type: 'custom',
+          event: 'custom-update',
+          data: { file },
+        });
+        return []; // Don't do normal HMR
+      }
+    },
+    
+    // Transform index.html
+    transformIndexHtml(html) {
+      return html.replace(
+        '</head>',
+        `<script>window.__VERSION__="${Date.now()}"</script></head>`
+      );
+    },
+  };
+}
+```
+
+### Implementing Code Splitting Logic
+
+```javascript
+// CUSTOM CODE SPLITTING STRATEGY
+
+class ChunkSplitter {
+  constructor(options = {}) {
+    this.options = {
+      minChunkSize: options.minChunkSize || 20000,
+      maxChunkSize: options.maxChunkSize || 250000,
+      vendorPattern: options.vendorPattern || /node_modules/,
+    };
+    this.chunks = new Map();
+  }
+  
+  // Analyze module graph
+  analyzeGraph(modules) {
+    const graph = {
+      nodes: new Map(),
+      edges: new Map(),
+    };
+    
+    for (const mod of modules) {
+      graph.nodes.set(mod.id, {
+        id: mod.id,
+        size: mod.code.length,
+        isVendor: this.options.vendorPattern.test(mod.id),
+        imports: mod.imports,
+        importedBy: [],
+      });
+    }
+    
+    // Build reverse edges
+    for (const [id, node] of graph.nodes) {
+      for (const imp of node.imports) {
+        const target = graph.nodes.get(imp);
+        if (target) {
+          target.importedBy.push(id);
+        }
+      }
+    }
+    
+    return graph;
+  }
+  
+  // Determine chunks
+  splitChunks(graph, entries) {
+    const chunks = [];
+    
+    // Create vendor chunk
+    const vendorModules = [...graph.nodes.values()]
+      .filter(n => n.isVendor);
+    
+    if (vendorModules.length > 0) {
+      chunks.push({
+        name: 'vendor',
+        modules: vendorModules.map(n => n.id),
+      });
+    }
+    
+    // Create chunks per entry
+    for (const entry of entries) {
+      const reachable = this.getReachableModules(graph, entry);
+      const nonVendor = reachable.filter(id => !graph.nodes.get(id)?.isVendor);
+      
+      // Split large chunks
+      const subChunks = this.splitBySize(nonVendor, graph);
+      chunks.push(...subChunks.map((mods, i) => ({
+        name: `${entry}-${i}`,
+        modules: mods,
+      })));
+    }
+    
+    // Find shared chunks
+    const sharedChunks = this.findSharedChunks(chunks, graph);
+    chunks.push(...sharedChunks);
+    
+    return chunks;
+  }
+  
+  getReachableModules(graph, entry) {
+    const visited = new Set();
+    const queue = [entry];
+    
+    while (queue.length > 0) {
+      const id = queue.shift();
+      if (visited.has(id)) continue;
+      visited.add(id);
+      
+      const node = graph.nodes.get(id);
+      if (node) {
+        queue.push(...node.imports);
+      }
+    }
+    
+    return [...visited];
+  }
+  
+  findSharedChunks(chunks, graph) {
+    // Find modules used by multiple chunks
+    const moduleUsage = new Map();
+    
+    for (const chunk of chunks) {
+      for (const modId of chunk.modules) {
+        if (!moduleUsage.has(modId)) {
+          moduleUsage.set(modId, []);
+        }
+        moduleUsage.get(modId).push(chunk.name);
+      }
+    }
+    
+    // Extract frequently shared modules
+    const shared = [];
+    for (const [modId, usedBy] of moduleUsage) {
+      if (usedBy.length >= 2) {
+        shared.push(modId);
+      }
+    }
+    
+    if (shared.length > 0) {
+      return [{ name: 'shared', modules: shared }];
+    }
+    
+    return [];
+  }
+}
+```
+
+### Building a Module Transformer
+
+```javascript
+// AST-BASED MODULE TRANSFORMER
+
+import * as acorn from 'acorn';
+import * as walk from 'acorn-walk';
+import MagicString from 'magic-string';
+
+class ModuleTransformer {
+  transform(code, options = {}) {
+    const ast = acorn.parse(code, {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+    });
+    
+    const s = new MagicString(code);
+    
+    // Transform imports
+    walk.simple(ast, {
+      ImportDeclaration(node) {
+        const source = node.source.value;
+        
+        // Resolve bare imports
+        if (!source.startsWith('.') && !source.startsWith('/')) {
+          const resolved = resolveNodeModule(source);
+          s.overwrite(
+            node.source.start,
+            node.source.end,
+            `"${resolved}"`
+          );
+        }
+      },
+      
+      // Transform dynamic imports
+      ImportExpression(node) {
+        const source = node.source;
+        if (source.type === 'Literal') {
+          const resolved = resolvePath(source.value);
+          s.overwrite(source.start, source.end, `"${resolved}"`);
+        }
+      },
+      
+      // Transform exports for HMR
+      ExportDefaultDeclaration(node) {
+        if (options.hmr) {
+          const decl = node.declaration;
+          s.appendLeft(decl.start, '__hmr_wrap(');
+          s.appendRight(decl.end, ')');
+        }
+      },
+    });
+    
+    return {
+      code: s.toString(),
+      map: s.generateMap({ hires: true }),
+    };
+  }
+}
+
+// Import analysis
+function analyzeImports(code) {
+  const ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module' });
+  const imports = [];
+  const exports = [];
+  
+  walk.simple(ast, {
+    ImportDeclaration(node) {
+      imports.push({
+        source: node.source.value,
+        specifiers: node.specifiers.map(s => ({
+          type: s.type,
+          imported: s.imported?.name || 'default',
+          local: s.local.name,
+        })),
+      });
+    },
+    
+    ExportNamedDeclaration(node) {
+      if (node.declaration) {
+        if (node.declaration.type === 'VariableDeclaration') {
+          for (const decl of node.declaration.declarations) {
+            exports.push({ name: decl.id.name, type: 'named' });
+          }
+        } else if (node.declaration.id) {
+          exports.push({ name: node.declaration.id.name, type: 'named' });
+        }
+      }
+    },
+    
+    ExportDefaultDeclaration() {
+      exports.push({ name: 'default', type: 'default' });
+    },
+  });
+  
+  return { imports, exports };
+}
+```
+
+### Implementing Source Maps
+
+```javascript
+// SOURCE MAP GENERATION
+
+class SourceMapGenerator {
+  constructor() {
+    this.mappings = [];
+    this.sources = [];
+    this.sourcesContent = [];
+    this.names = [];
+  }
+  
+  addSource(filename, content) {
+    const index = this.sources.indexOf(filename);
+    if (index !== -1) return index;
+    
+    this.sources.push(filename);
+    this.sourcesContent.push(content);
+    return this.sources.length - 1;
+  }
+  
+  addMapping(generated, original, sourceIndex, name) {
+    this.mappings.push({
+      generatedLine: generated.line,
+      generatedColumn: generated.column,
+      originalLine: original.line,
+      originalColumn: original.column,
+      sourceIndex,
+      nameIndex: name ? this.addName(name) : undefined,
+    });
+  }
+  
+  addName(name) {
+    const index = this.names.indexOf(name);
+    if (index !== -1) return index;
+    this.names.push(name);
+    return this.names.length - 1;
+  }
+  
+  generate() {
+    // Sort mappings
+    this.mappings.sort((a, b) => 
+      a.generatedLine - b.generatedLine || 
+      a.generatedColumn - b.generatedColumn
+    );
+    
+    // Encode mappings to VLQ
+    const encodedMappings = this.encodeMappings();
+    
+    return {
+      version: 3,
+      sources: this.sources,
+      sourcesContent: this.sourcesContent,
+      names: this.names,
+      mappings: encodedMappings,
+    };
+  }
+  
+  encodeMappings() {
+    let result = '';
+    let previousGeneratedLine = 1;
+    let previousGeneratedColumn = 0;
+    let previousOriginalLine = 0;
+    let previousOriginalColumn = 0;
+    let previousSourceIndex = 0;
+    let previousNameIndex = 0;
+    
+    for (let i = 0; i < this.mappings.length; i++) {
+      const mapping = this.mappings[i];
+      
+      // New lines
+      while (previousGeneratedLine < mapping.generatedLine) {
+        result += ';';
+        previousGeneratedLine++;
+        previousGeneratedColumn = 0;
+      }
+      
+      if (i > 0 && this.mappings[i - 1].generatedLine === mapping.generatedLine) {
+        result += ',';
+      }
+      
+      // Encode segment
+      let segment = this.encodeVLQ(mapping.generatedColumn - previousGeneratedColumn);
+      previousGeneratedColumn = mapping.generatedColumn;
+      
+      segment += this.encodeVLQ(mapping.sourceIndex - previousSourceIndex);
+      previousSourceIndex = mapping.sourceIndex;
+      
+      segment += this.encodeVLQ(mapping.originalLine - previousOriginalLine);
+      previousOriginalLine = mapping.originalLine;
+      
+      segment += this.encodeVLQ(mapping.originalColumn - previousOriginalColumn);
+      previousOriginalColumn = mapping.originalColumn;
+      
+      if (mapping.nameIndex !== undefined) {
+        segment += this.encodeVLQ(mapping.nameIndex - previousNameIndex);
+        previousNameIndex = mapping.nameIndex;
+      }
+      
+      result += segment;
+    }
+    
+    return result;
+  }
+  
+  encodeVLQ(value) {
+    const VLQ_BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    let encoded = '';
+    let vlq = value < 0 ? ((-value) << 1) + 1 : value << 1;
+    
+    do {
+      let digit = vlq & 0x1f;
+      vlq >>>= 5;
+      if (vlq > 0) digit |= 0x20;
+      encoded += VLQ_BASE64[digit];
+    } while (vlq > 0);
+    
+    return encoded;
+  }
+}
+```
+
 ## Related Skills
 
 - See [meta-frameworks-overview](../meta-frameworks-overview/SKILL.md) for framework build setups

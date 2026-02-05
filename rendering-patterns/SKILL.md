@@ -707,6 +707,406 @@ Solution: Caching (SSG/ISR) or scaling servers
 - Page has mixed static/dynamic content
 - User experience during load matters
 
+---
+
+## For Framework Authors: Implementing Rendering Systems
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building rendering systems. There are many valid implementation strategies—the direction shown here is based on patterns from React, Preact, Solid, and other frameworks. Your implementation may differ based on your virtual DOM design, component model, and performance goals. Use these as architectural guidance rather than prescriptive solutions.
+
+### Building a Server-Side Renderer
+
+Core SSR implementation for React-like frameworks:
+
+```javascript
+// MINIMAL SSR IMPLEMENTATION
+
+// 1. Component to HTML string conversion
+function renderToString(element) {
+  if (typeof element === 'string' || typeof element === 'number') {
+    return escapeHtml(String(element));
+  }
+  
+  if (element === null || element === undefined || element === false) {
+    return '';
+  }
+  
+  if (Array.isArray(element)) {
+    return element.map(renderToString).join('');
+  }
+  
+  const { type, props } = element;
+  
+  // Function component
+  if (typeof type === 'function') {
+    const result = type(props);
+    return renderToString(result);
+  }
+  
+  // HTML element
+  const attributes = renderAttributes(props);
+  const children = renderToString(props.children);
+  
+  // Void elements (no closing tag)
+  if (VOID_ELEMENTS.has(type)) {
+    return `<${type}${attributes}>`;
+  }
+  
+  return `<${type}${attributes}>${children}</${type}>`;
+}
+
+function renderAttributes(props) {
+  return Object.entries(props || {})
+    .filter(([key]) => key !== 'children' && !key.startsWith('on'))
+    .map(([key, value]) => {
+      if (key === 'className') key = 'class';
+      if (key === 'htmlFor') key = 'for';
+      if (typeof value === 'boolean') {
+        return value ? ` ${key}` : '';
+      }
+      return ` ${key}="${escapeHtml(String(value))}"`;
+    })
+    .join('');
+}
+
+// 2. Full HTML document wrapper
+function renderDocument(app, { head, scripts, styles }) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  ${head}
+  ${styles.map(s => `<link rel="stylesheet" href="${s}">`).join('\n')}
+</head>
+<body>
+  <div id="app">${app}</div>
+  ${scripts.map(s => `<script src="${s}"></script>`).join('\n')}
+</body>
+</html>`;
+}
+
+// 3. Server handler
+async function handleSSR(request) {
+  const url = new URL(request.url);
+  const route = matchRoute(url.pathname);
+  
+  // Fetch data on server
+  const data = await route.loader?.({ request, params: route.params });
+  
+  // Render component tree
+  const app = renderToString(
+    createElement(route.component, { data })
+  );
+  
+  // Serialize data for hydration
+  const serializedData = `<script>window.__DATA__=${JSON.stringify(data)}</script>`;
+  
+  const html = renderDocument(app, {
+    head: renderHead(route),
+    scripts: ['/client.js'],
+    styles: ['/styles.css'],
+  }) + serializedData;
+  
+  return new Response(html, {
+    headers: { 'Content-Type': 'text/html' },
+  });
+}
+```
+
+### Implementing Streaming SSR
+
+```javascript
+// STREAMING SSR IMPLEMENTATION
+
+async function* renderToStream(element, context) {
+  // Yield shell immediately
+  yield '<!DOCTYPE html><html><head></head><body><div id="app">';
+  
+  // Render with suspense boundaries
+  yield* renderWithSuspense(element, context);
+  
+  // Yield closing tags
+  yield '</div></body></html>';
+}
+
+async function* renderWithSuspense(element, context) {
+  if (element.type === Suspense) {
+    const suspenseId = context.nextSuspenseId++;
+    
+    // Yield fallback immediately
+    yield `<template id="S:${suspenseId}">`;
+    yield renderToString(element.props.fallback);
+    yield `</template>`;
+    
+    // Start async work
+    context.pendingBoundaries.push({
+      id: suspenseId,
+      promise: renderChildren(element.props.children, context),
+    });
+    
+    return;
+  }
+  
+  // Regular element - render synchronously
+  yield renderToString(element);
+}
+
+// Stream pending boundaries as they complete
+async function* flushPendingBoundaries(context) {
+  while (context.pendingBoundaries.length > 0) {
+    const completed = await Promise.race(
+      context.pendingBoundaries.map(b => 
+        b.promise.then(html => ({ id: b.id, html }))
+      )
+    );
+    
+    // Remove from pending
+    context.pendingBoundaries = context.pendingBoundaries.filter(
+      b => b.id !== completed.id
+    );
+    
+    // Yield swap script
+    yield `<script>
+      const template = document.getElementById('S:${completed.id}');
+      const content = document.createElement('div');
+      content.innerHTML = ${JSON.stringify(completed.html)};
+      template.replaceWith(content.firstChild);
+    </script>`;
+  }
+}
+
+// HTTP handler with streaming
+async function handleStreamingSSR(request) {
+  const stream = new ReadableStream({
+    async start(controller) {
+      const context = {
+        nextSuspenseId: 0,
+        pendingBoundaries: [],
+      };
+      
+      // Stream initial content
+      for await (const chunk of renderToStream(<App />, context)) {
+        controller.enqueue(new TextEncoder().encode(chunk));
+      }
+      
+      // Stream pending boundaries
+      for await (const chunk of flushPendingBoundaries(context)) {
+        controller.enqueue(new TextEncoder().encode(chunk));
+      }
+      
+      controller.close();
+    },
+  });
+  
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/html',
+      'Transfer-Encoding': 'chunked',
+    },
+  });
+}
+```
+
+### Building a Static Site Generator
+
+```javascript
+// STATIC SITE GENERATOR IMPLEMENTATION
+
+async function buildStaticSite(config) {
+  const routes = await discoverRoutes(config.pagesDir);
+  const outputDir = config.outputDir;
+  
+  // Parallel build with concurrency limit
+  const limit = pLimit(10);
+  
+  await Promise.all(
+    routes.map(route => 
+      limit(async () => {
+        console.log(`Building ${route.path}...`);
+        
+        // For dynamic routes, get all possible values
+        if (route.isDynamic) {
+          const paths = await route.getStaticPaths();
+          await Promise.all(
+            paths.map(p => buildPage(route, p, outputDir))
+          );
+        } else {
+          await buildPage(route, {}, outputDir);
+        }
+      })
+    )
+  );
+  
+  // Copy static assets
+  await copyDir(config.publicDir, outputDir);
+  
+  // Generate sitemap
+  await generateSitemap(routes, outputDir);
+}
+
+async function buildPage(route, params, outputDir) {
+  // Fetch data at build time
+  const data = await route.loader?.({ params });
+  
+  // Render to string
+  const html = renderToString(
+    createElement(route.component, { data, params })
+  );
+  
+  // Wrap in document
+  const fullHtml = renderDocument(html, {
+    head: renderHead(route, data),
+    scripts: route.hasInteractivity ? ['/hydrate.js'] : [],
+    styles: ['/styles.css'],
+  });
+  
+  // Write to file
+  const filePath = path.join(outputDir, route.path, 'index.html');
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, fullHtml);
+}
+```
+
+### Implementing ISR (Incremental Static Regeneration)
+
+```javascript
+// ISR IMPLEMENTATION
+
+class ISRCache {
+  constructor() {
+    this.cache = new Map();
+    this.regenerating = new Set();
+  }
+  
+  async get(key, regenerate, { revalidate = 60 }) {
+    const entry = this.cache.get(key);
+    const now = Date.now();
+    
+    if (entry) {
+      const age = (now - entry.timestamp) / 1000;
+      
+      // Fresh - return cached
+      if (age < revalidate) {
+        return { html: entry.html, status: 'HIT' };
+      }
+      
+      // Stale - return cached but regenerate in background
+      if (!this.regenerating.has(key)) {
+        this.regenerating.add(key);
+        this.regenerateInBackground(key, regenerate);
+      }
+      
+      return { html: entry.html, status: 'STALE' };
+    }
+    
+    // Miss - generate synchronously
+    const html = await regenerate();
+    this.cache.set(key, { html, timestamp: now });
+    
+    return { html, status: 'MISS' };
+  }
+  
+  async regenerateInBackground(key, regenerate) {
+    try {
+      const html = await regenerate();
+      this.cache.set(key, { html, timestamp: Date.now() });
+    } finally {
+      this.regenerating.delete(key);
+    }
+  }
+  
+  // On-demand revalidation
+  revalidate(key) {
+    this.cache.delete(key);
+  }
+  
+  // Revalidate by tag
+  revalidateTag(tag) {
+    for (const [key, entry] of this.cache) {
+      if (entry.tags?.includes(tag)) {
+        this.cache.delete(key);
+      }
+    }
+  }
+}
+
+// HTTP handler with ISR
+const isrCache = new ISRCache();
+
+async function handleISR(request) {
+  const url = new URL(request.url);
+  const route = matchRoute(url.pathname);
+  
+  const { html, status } = await isrCache.get(
+    url.pathname,
+    async () => {
+      const data = await route.loader({ request });
+      return renderToString(createElement(route.component, { data }));
+    },
+    { revalidate: route.revalidate || 60 }
+  );
+  
+  return new Response(html, {
+    headers: {
+      'Content-Type': 'text/html',
+      'X-Cache-Status': status,
+      'Cache-Control': `s-maxage=${route.revalidate}, stale-while-revalidate`,
+    },
+  });
+}
+```
+
+### Edge Rendering Architecture
+
+```javascript
+// EDGE RENDERING IMPLEMENTATION
+
+// Edge-compatible rendering (V8 isolates)
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    
+    // Check edge cache first
+    const cacheKey = new Request(url.toString(), request);
+    const cache = caches.default;
+    let response = await cache.match(cacheKey);
+    
+    if (!response) {
+      // Render at edge
+      const html = await renderPage(url.pathname, {
+        // Edge has access to geolocation
+        country: request.cf?.country,
+        city: request.cf?.city,
+      });
+      
+      response = new Response(html, {
+        headers: {
+          'Content-Type': 'text/html',
+          'Cache-Control': 's-maxage=60',
+        },
+      });
+      
+      // Cache at edge
+      ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    }
+    
+    return response;
+  },
+};
+
+// Personalization at the edge
+async function renderPage(pathname, context) {
+  const route = matchRoute(pathname);
+  
+  // Personalize based on location
+  const data = await route.loader({
+    country: context.country,
+    locale: countryToLocale(context.country),
+  });
+  
+  return renderToString(createElement(route.component, { data }));
+}
+```
+
 ## Related Skills
 
 - See [web-app-architectures](../web-app-architectures/SKILL.md) for SPA vs MPA

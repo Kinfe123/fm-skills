@@ -1028,6 +1028,467 @@ window.addEventListener('popstate', (event) => {
 // Client must scroll to #reviews element
 ```
 
+---
+
+## For Framework Authors: Building Routing Systems
+
+> **Implementation Note**: The patterns and code examples below represent one proven approach to building routing systems. Different frameworks take different approaches—React Router uses a declarative model, Next.js uses file-based routing, and SvelteKit combines both. The direction shown here provides core concepts that most routers share. Adapt these patterns based on your framework's component model, build pipeline, and developer experience goals.
+
+### Implementing a Route Matcher
+
+```javascript
+// ROUTE MATCHING IMPLEMENTATION
+
+class RouteMatcher {
+  constructor() {
+    this.routes = [];
+  }
+  
+  // Add route with pattern
+  add(pattern, handler, meta = {}) {
+    const { regex, paramNames, score } = this.compilePattern(pattern);
+    this.routes.push({ pattern, regex, paramNames, handler, meta, score });
+    // Keep sorted by specificity
+    this.routes.sort((a, b) => b.score - a.score);
+  }
+  
+  // Compile pattern to regex
+  compilePattern(pattern) {
+    const paramNames = [];
+    let score = 0;
+    
+    const regexStr = pattern
+      .split('/')
+      .filter(Boolean)
+      .map(segment => {
+        // Catch-all: [...param]
+        if (segment.startsWith('[...') && segment.endsWith(']')) {
+          paramNames.push(segment.slice(4, -1));
+          score += 1; // Lowest priority
+          return '(.+)';
+        }
+        
+        // Optional: [[param]]
+        if (segment.startsWith('[[') && segment.endsWith(']]')) {
+          paramNames.push(segment.slice(2, -2));
+          score += 5;
+          return '([^/]*)';
+        }
+        
+        // Dynamic: [param]
+        if (segment.startsWith('[') && segment.endsWith(']')) {
+          paramNames.push(segment.slice(1, -1));
+          score += 10;
+          return '([^/]+)';
+        }
+        
+        // Static segment
+        score += 100;
+        return escapeRegex(segment);
+      })
+      .join('/');
+    
+    return {
+      regex: new RegExp(`^/${regexStr}/?$`),
+      paramNames,
+      score,
+    };
+  }
+  
+  // Match URL to route
+  match(pathname) {
+    for (const route of this.routes) {
+      const match = pathname.match(route.regex);
+      if (match) {
+        const params = {};
+        route.paramNames.forEach((name, i) => {
+          const value = match[i + 1];
+          // Handle catch-all as array
+          if (route.pattern.includes(`[...${name}]`)) {
+            params[name] = value ? value.split('/') : [];
+          } else {
+            params[name] = value;
+          }
+        });
+        
+        return { route, params };
+      }
+    }
+    return null;
+  }
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+```
+
+### Building a File-Based Router Generator
+
+```javascript
+// FILE-BASED ROUTING GENERATOR (Build Tool)
+
+import { glob } from 'glob';
+import path from 'path';
+import { parse } from '@babel/parser';
+
+async function generateRouteManifest(config) {
+  const { pagesDir, extensions = ['.tsx', '.jsx', '.ts', '.js'] } = config;
+  
+  // Find all route files
+  const pattern = `**/*{${extensions.join(',')}}`;
+  const files = await glob(pattern, { cwd: pagesDir });
+  
+  const routes = [];
+  
+  for (const file of files) {
+    // Skip special files
+    if (file.startsWith('_') || file.includes('/_')) continue;
+    
+    const route = await processRouteFile(pagesDir, file);
+    if (route) routes.push(route);
+  }
+  
+  // Sort by specificity
+  routes.sort((a, b) => b.score - a.score);
+  
+  return routes;
+}
+
+async function processRouteFile(pagesDir, file) {
+  const fullPath = path.join(pagesDir, file);
+  const content = await fs.readFile(fullPath, 'utf-8');
+  const ast = parse(content, { sourceType: 'module', plugins: ['jsx', 'typescript'] });
+  
+  // Extract route metadata from exports
+  const meta = extractRouteMeta(ast);
+  
+  // Convert file path to route pattern
+  let route = file
+    .replace(/\.(tsx?|jsx?)$/, '')    // Remove extension
+    .replace(/\/index$/, '')           // /index -> /
+    .replace(/\[\.\.\.(\w+)\]/g, '*')  // [...slug] -> *
+    .replace(/\[\[(\w+)\]\]/g, ':$1?') // [[id]] -> :id?
+    .replace(/\[(\w+)\]/g, ':$1');     // [id] -> :id
+  
+  if (!route) route = '/';
+  else if (!route.startsWith('/')) route = '/' + route;
+  
+  return {
+    path: route,
+    file: fullPath,
+    ...meta,
+    score: calculateScore(route),
+  };
+}
+
+function extractRouteMeta(ast) {
+  const meta = {};
+  
+  // Look for exported config
+  for (const node of ast.program.body) {
+    if (node.type === 'ExportNamedDeclaration') {
+      if (node.declaration?.declarations?.[0]?.id?.name === 'config') {
+        // Extract static config
+        meta.config = evaluateStaticObject(node.declaration.declarations[0].init);
+      }
+    }
+  }
+  
+  return meta;
+}
+
+// Generate route manifest code
+function emitRouteManifest(routes) {
+  return `
+// Auto-generated route manifest
+export const routes = [
+${routes.map(r => `  {
+    path: ${JSON.stringify(r.path)},
+    component: () => import(${JSON.stringify(r.file)}),
+    meta: ${JSON.stringify(r.meta || {})},
+  }`).join(',\n')}
+];
+`;
+}
+```
+
+### Implementing Nested Routes and Layouts
+
+```javascript
+// NESTED ROUTING IMPLEMENTATION
+
+class NestedRouter {
+  constructor() {
+    this.root = { children: [], layout: null, page: null };
+  }
+  
+  // Build route tree from flat routes
+  buildTree(routes) {
+    for (const route of routes) {
+      this.insertRoute(route);
+    }
+  }
+  
+  insertRoute(route) {
+    const segments = route.path.split('/').filter(Boolean);
+    let node = this.root;
+    
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      let child = node.children.find(c => c.segment === segment);
+      
+      if (!child) {
+        child = { segment, children: [], layout: null, page: null };
+        node.children.push(child);
+      }
+      
+      node = child;
+    }
+    
+    // Assign component based on file type
+    if (route.file.includes('layout')) {
+      node.layout = route.component;
+    } else if (route.file.includes('page')) {
+      node.page = route.component;
+    }
+  }
+  
+  // Match and collect all layouts + page
+  match(pathname) {
+    const segments = pathname.split('/').filter(Boolean);
+    const matched = [];
+    let node = this.root;
+    const params = {};
+    
+    // Always include root layout
+    if (node.layout) matched.push({ component: node.layout, params: {} });
+    
+    for (const segment of segments) {
+      // Find matching child
+      let child = node.children.find(c => c.segment === segment);
+      
+      // Try dynamic match
+      if (!child) {
+        child = node.children.find(c => c.segment.startsWith(':'));
+        if (child) {
+          const paramName = child.segment.slice(1);
+          params[paramName] = segment;
+        }
+      }
+      
+      if (!child) return null; // No match
+      
+      if (child.layout) {
+        matched.push({ component: child.layout, params: { ...params } });
+      }
+      
+      node = child;
+    }
+    
+    // Add final page
+    if (node.page) {
+      matched.push({ component: node.page, params: { ...params }, isPage: true });
+    }
+    
+    return { matched, params };
+  }
+}
+
+// Render nested routes with outlet pattern
+async function renderNestedRoute(matched) {
+  let content = null;
+  
+  // Render inside-out (page first, then wrap with layouts)
+  for (let i = matched.length - 1; i >= 0; i--) {
+    const { component, params, isPage } = matched[i];
+    const Component = await component();
+    
+    if (isPage) {
+      content = createElement(Component.default, { params });
+    } else {
+      // Layout receives children as outlet
+      content = createElement(Component.default, { 
+        params, 
+        children: content,
+      });
+    }
+  }
+  
+  return content;
+}
+```
+
+### Route Preloading System
+
+```javascript
+// ROUTE PRELOADING IMPLEMENTATION
+
+class RoutePreloader {
+  constructor(router) {
+    this.router = router;
+    this.preloaded = new Set();
+    this.preloading = new Map();
+  }
+  
+  // Preload on hover
+  setupHoverPreload() {
+    document.addEventListener('mouseenter', (e) => {
+      const link = e.target.closest('a[href]');
+      if (!link) return;
+      
+      const href = link.getAttribute('href');
+      if (href.startsWith('/') && !this.preloaded.has(href)) {
+        this.preload(href);
+      }
+    }, true);
+  }
+  
+  // Preload visible links
+  setupViewportPreload() {
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const href = entry.target.getAttribute('href');
+          if (!this.preloaded.has(href)) {
+            // Use requestIdleCallback for low-priority preload
+            requestIdleCallback(() => this.preload(href));
+          }
+        }
+      });
+    }, { rootMargin: '200px' });
+    
+    document.querySelectorAll('a[href^="/"]').forEach(link => {
+      observer.observe(link);
+    });
+  }
+  
+  async preload(pathname) {
+    if (this.preloading.has(pathname)) {
+      return this.preloading.get(pathname);
+    }
+    
+    const match = this.router.match(pathname);
+    if (!match) return;
+    
+    const preloadPromise = (async () => {
+      // Preload component code
+      const componentPromises = match.matched.map(m => m.component());
+      
+      // Preload data if route has loader
+      const route = match.matched.find(m => m.isPage);
+      const dataPromise = route?.loader?.({ 
+        params: match.params, 
+        preload: true 
+      });
+      
+      await Promise.all([...componentPromises, dataPromise]);
+      this.preloaded.add(pathname);
+    })();
+    
+    this.preloading.set(pathname, preloadPromise);
+    
+    try {
+      await preloadPromise;
+    } finally {
+      this.preloading.delete(pathname);
+    }
+  }
+}
+```
+
+### Navigation State Management
+
+```javascript
+// NAVIGATION STATE IMPLEMENTATION
+
+class NavigationManager {
+  constructor() {
+    this.state = 'idle'; // idle | loading | submitting
+    this.location = window.location.pathname;
+    this.listeners = new Set();
+  }
+  
+  subscribe(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  
+  notify() {
+    this.listeners.forEach(l => l({
+      state: this.state,
+      location: this.location,
+    }));
+  }
+  
+  async navigate(to, options = {}) {
+    const { replace = false, state = {} } = options;
+    
+    this.state = 'loading';
+    this.notify();
+    
+    try {
+      // Run before navigation hooks
+      for (const hook of this.beforeHooks) {
+        const result = await hook(this.location, to);
+        if (result === false) {
+          this.state = 'idle';
+          this.notify();
+          return;
+        }
+        if (typeof result === 'string') {
+          to = result; // Redirect
+        }
+      }
+      
+      // Update URL
+      if (replace) {
+        history.replaceState(state, '', to);
+      } else {
+        history.pushState(state, '', to);
+      }
+      
+      this.location = to;
+      
+      // Load and render route
+      await this.renderRoute(to);
+      
+      // Scroll to top or hash
+      if (to.includes('#')) {
+        document.querySelector(to.split('#')[1])?.scrollIntoView();
+      } else {
+        window.scrollTo(0, 0);
+      }
+      
+    } catch (error) {
+      console.error('Navigation failed:', error);
+      throw error;
+    } finally {
+      this.state = 'idle';
+      this.notify();
+    }
+  }
+}
+
+// React hook for navigation state
+function useNavigation() {
+  const [state, setState] = useState({ state: 'idle', location: '' });
+  
+  useEffect(() => {
+    return navigationManager.subscribe(setState);
+  }, []);
+  
+  return state;
+}
+
+// Usage in components
+function LoadingBar() {
+  const { state } = useNavigation();
+  
+  return state === 'loading' ? <ProgressBar /> : null;
+}
+```
+
 ## Related Skills
 
 - See [web-app-architectures](../web-app-architectures/SKILL.md) for SPA vs MPA routing

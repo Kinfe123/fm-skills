@@ -10,6 +10,7 @@ These skills help AI assistants understand:
 - Different rendering strategies and when to use each
 - SEO implications of architectural decisions
 - Universal JavaScript and cross-platform deployment (Nitro, H3, edge runtimes)
+- Middleware patterns for request/response processing (auth, CORS, rate limiting)
 - How meta-frameworks solve common problems
 - Hydration, routing, and other core concepts
 
@@ -29,6 +30,7 @@ Rather than framework-specific instructions, these skills provide the **conceptu
 | [data-fetching-patterns](./data-fetching-patterns/SKILL.md) | Fetch patterns, caching, loading states |
 | [build-pipelines-bundling](./build-pipelines-bundling/SKILL.md) | Bundling, code splitting, tree shaking, build optimization |
 | [universal-javascript-runtimes](./universal-javascript-runtimes/SKILL.md) | Nitro, H3, unenv, web standards, cross-platform deployment |
+| [middleware-patterns](./middleware-patterns/SKILL.md) | Server/edge middleware, request pipelines, auth, CORS, rate limiting |
 
 ## Learning Path
 
@@ -53,7 +55,9 @@ For best understanding, read the skills in this order:
         ↓
 9. universal-javascript-runtimes (Deploy anywhere: edge, serverless, Node)
         ↓
-10. meta-frameworks-overview     (How frameworks implement all of the above)
+10. middleware-patterns          (Request/response pipelines, auth, CORS)
+        ↓
+11. meta-frameworks-overview     (How frameworks implement all of the above)
 ```
 
 ## Installation
