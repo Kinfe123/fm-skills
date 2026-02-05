@@ -1,4 +1,4 @@
-# Framework Skills (fm-skills)
+# Framework Skills
 
 A collection of framework-agnostic AI skills for understanding modern web development fundamentals.
 
