@@ -282,6 +282,431 @@ Modern apps mix patterns per route:
 | ISR | Fastest | Fastest | Fastest | Fast |
 | Streaming | Fast | Fast | Progressive | Medium |
 
+---
+
+## Deep Dive: Understanding How Rendering Actually Works
+
+### What Does "Rendering" Actually Mean?
+
+Rendering is the process of converting your application code into HTML that a browser can display. Understanding this deeply requires knowing what happens at each layer.
+
+**The Rendering Pipeline:**
+
+```
+Your Code (JSX, Vue template, Svelte)
+        ↓
+Framework Virtual Representation (Virtual DOM, reactive graph)
+        ↓
+HTML String or DOM Operations
+        ↓
+Browser's DOM Tree
+        ↓
+Browser's Render Tree (DOM + CSS)
+        ↓
+Layout (position, size calculations)
+        ↓
+Paint (pixels on screen)
+        ↓
+Composite (layers combined)
+```
+
+When we say "server rendering" vs "client rendering", we're talking about WHERE the first few steps happen.
+
+### The Fundamental Trade-off: Work Location
+
+Every web page requires work to be done. The question is: who does the work?
+
+```
+SERVER RENDERING:
+┌─────────────────────────────────────────────────────────────────┐
+│ SERVER (powerful, shared)                                       │
+│                                                                 │
+│  [Fetch Data] → [Build HTML String] → [Send HTML]              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ CLIENT (varies, individual)                                     │
+│                                                                 │
+│  [Parse HTML] → [Build DOM] → [Display]                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+
+CLIENT RENDERING:
+┌─────────────────────────────────────────────────────────────────┐
+│ SERVER (powerful, shared)                                       │
+│                                                                 │
+│  [Send static JS bundle]                                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ CLIENT (varies, individual)                                     │
+│                                                                 │
+│  [Download JS] → [Execute JS] → [Fetch Data] → [Build DOM]     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Server rendering: Server does more work, client does less
+Client rendering: Server does less work, client does more
+
+### How Server-Side Rendering Works Internally
+
+When a server renders HTML, it runs your component code to produce a string:
+
+```javascript
+// What your React component looks like
+function ProductPage({ product }) {
+  return (
+    <div className="product">
+      <h1>{product.name}</h1>
+      <p>${product.price}</p>
+    </div>
+  );
+}
+
+// What the server actually does (simplified)
+function renderToString(component) {
+  // 1. Execute component function
+  const virtualDOM = component({ product: { name: 'Shoes', price: 99 } });
+  
+  // 2. virtualDOM is a tree structure:
+  // {
+  //   type: 'div',
+  //   props: { className: 'product' },
+  //   children: [
+  //     { type: 'h1', children: ['Shoes'] },
+  //     { type: 'p', children: ['$99'] }
+  //   ]
+  // }
+  
+  // 3. Convert tree to HTML string
+  return '<div class="product"><h1>Shoes</h1><p>$99</p></div>';
+}
+```
+
+The server runs JavaScript to produce HTML. It's executing your React/Vue/Svelte code, but instead of updating a browser DOM, it builds a string.
+
+### How Client-Side Rendering Works Internally
+
+CSR works differently - it manipulates the live DOM:
+
+```javascript
+// Browser receives empty HTML:
+// <div id="root"></div>
+
+// JavaScript bundle executes:
+const root = document.getElementById('root');
+
+// Framework creates elements and appends them
+const div = document.createElement('div');
+div.className = 'product';
+
+const h1 = document.createElement('h1');
+h1.textContent = 'Shoes';
+
+const p = document.createElement('p');
+p.textContent = '$99';
+
+div.appendChild(h1);
+div.appendChild(p);
+root.appendChild(div);
+
+// Each DOM operation triggers browser work
+```
+
+Every DOM manipulation can trigger layout and paint. This is why virtual DOM exists - to batch changes.
+
+### Why SSG is Fastest: CDN Edge Caching
+
+Static Site Generation's speed comes from CDN distribution:
+
+```
+Traditional SSR:
+User (Tokyo) → Request → Origin Server (New York) → Process → Response
+              [───────────── 200-500ms ──────────────]
+
+Static + CDN:
+User (Tokyo) → Request → CDN Edge (Tokyo) → Cache Hit → Response
+              [──────────── 20-50ms ────────────]
+```
+
+**How CDNs Work:**
+
+```
+First Request (cache miss):
+1. User requests /products
+2. CDN edge has no cache
+3. Request goes to origin
+4. Origin returns HTML
+5. CDN caches it
+6. User receives response
+
+Subsequent Requests (cache hit):
+1. User requests /products
+2. CDN edge has cached HTML
+3. Immediate response (no origin contact)
+```
+
+With SSG, the HTML is pre-built and distributed to CDN edges worldwide BEFORE any user requests it.
+
+### ISR: How Stale-While-Revalidate Works
+
+ISR combines caching with freshness. Understanding the timeline is key:
+
+```
+Build Time: Page generated, cached with revalidate: 60
+
+Timeline:
+[0s]     Page built, served to all users
+[30s]    User A requests → Gets cached page (age: 30s, still fresh)
+[60s]    Page is now "stale" but still cached
+[61s]    User B requests → Gets stale page immediately
+         Background: Server regenerates page
+[62s]    New page ready, replaces old in cache
+[70s]    User C requests → Gets fresh page (age: 8s)
+```
+
+The key insight: **the user who triggers revalidation gets the stale page**. The NEXT user gets fresh content. This is "stale-while-revalidate" strategy.
+
+### Streaming: How HTTP Chunked Transfer Works
+
+Streaming isn't magic - it uses HTTP's chunked transfer encoding:
+
+```
+Normal Response:
+HTTP/1.1 200 OK
+Content-Length: 5000
+
+[...waits until all 5000 bytes ready...]
+[...sends all at once...]
+
+
+Chunked/Streaming Response:
+HTTP/1.1 200 OK
+Transfer-Encoding: chunked
+
+100                          ← Chunk size in hex (256 bytes)
+<html><head>...</head><body> ← Actual content
+0                            ← More chunks coming
+
+200                          ← Next chunk (512 bytes)
+<main>Content here...</main>
+0
+
+0                            ← Final chunk (0 means done)
+```
+
+The browser can start rendering BEFORE the full response arrives.
+
+**React Streaming Example:**
+
+```jsx
+// Server Component
+async function Page() {
+  return (
+    <html>
+      <body>
+        <Header />  {/* Immediate - no data */}
+        
+        <Suspense fallback={<LoadingSkeleton />}>
+          <SlowDataComponent />  {/* Streams when ready */}
+        </Suspense>
+        
+        <Footer />  {/* Immediate - no data */}
+      </body>
+    </html>
+  );
+}
+
+// What gets streamed:
+// Chunk 1: <html><body><Header>...</Header><LoadingSkeleton />
+// [... server fetching SlowDataComponent data ...]
+// Chunk 2: <script>swapContent('slow-component', '<SlowData>...</SlowData>')</script>
+// Chunk 3: <Footer>...</Footer></body></html>
+```
+
+### Time to First Byte (TTFB) vs Time to Last Byte
+
+Understanding these metrics clarifies rendering tradeoffs:
+
+```
+CSR Request:
+[Request]─────[TTFB: 50ms]─────[TTLB: 100ms]
+              Small static file, fast to send
+
+SSR Request (blocking):
+[Request]─────────────────────[TTFB: 500ms]─────[TTLB: 520ms]
+              Server processing delays first byte
+
+SSR Request (streaming):
+[Request]───[TTFB: 50ms]─────────────────────────[TTLB: 500ms]
+            Shell immediate      Content streams progressively
+```
+
+Streaming improves TTFB dramatically while allowing complex server work.
+
+### The N+1 Problem in Rendering
+
+Both SSR and CSR can suffer from N+1 data fetching:
+
+```javascript
+// Waterfall problem
+async function ProductsPage() {
+  const products = await fetch('/api/products');  // 1 request
+  
+  return products.map(product => (
+    <Product 
+      product={product}
+      reviews={await fetch(`/api/reviews/${product.id}`)}  // N requests
+    />
+  ));
+}
+
+// If you have 50 products = 51 requests (serial!)
+// Each awaits the previous = massive latency
+```
+
+**Solution - Parallel fetching:**
+
+```javascript
+async function ProductsPage() {
+  const products = await fetch('/api/products');
+  
+  // Fetch all reviews in parallel
+  const reviewsPromises = products.map(p => 
+    fetch(`/api/reviews/${p.id}`)
+  );
+  const reviews = await Promise.all(reviewsPromises);
+  
+  // Now render with all data
+}
+```
+
+### Cache Invalidation: The Hard Problem
+
+"There are only two hard things in Computer Science: cache invalidation and naming things."
+
+```
+Problem Scenario:
+1. Page generated with product price $99
+2. Price changes to $89 in database
+3. Cached page still shows $99
+4. User sees wrong price
+
+Cache Strategies:
+
+TIME-BASED (ISR):
+- Revalidate every 60 seconds
+- Pros: Simple, predictable
+- Cons: Up to 60s stale data
+
+EVENT-BASED (On-demand revalidation):
+- CMS webhook triggers rebuild
+- Pros: Immediate freshness
+- Cons: Complex, webhook reliability
+
+CACHE TAGS:
+- Tag pages by dependency: ['product-123', 'category-shoes']
+- Invalidate by tag when data changes
+- Pros: Precise invalidation
+- Cons: Complex dependency tracking
+```
+
+### Edge Rendering vs Origin Rendering
+
+Modern architectures introduce edge computing:
+
+```
+ORIGIN RENDERING (traditional SSR):
+User → CDN Edge → Origin Server (single location) → Response
+       [20ms]     [─────── 200ms ───────]
+
+EDGE RENDERING:
+User → CDN Edge (runs your code) → Response
+       [──────── 50ms ───────]
+       No origin round-trip needed
+
+EDGE + ORIGIN:
+User → Edge (static parts) → Origin (dynamic parts)
+       [──── 50ms ────]     [─── 150ms for dynamic ───]
+       Shell immediate       Data streams in
+```
+
+Edge functions run your server code geographically close to users. Platforms like Cloudflare Workers, Vercel Edge, Deno Deploy enable this.
+
+### Memory and CPU: The Rendering Costs
+
+**CSR Memory Pattern:**
+
+```
+Browser Memory Over Time:
+[Page Load] → [JS Parsed: 50MB heap] → [App Runs: 80MB] → [Navigation: 100MB] → ...
+                                       Memory grows, garbage collected periodically
+                                       Memory leaks possible if state not cleaned
+```
+
+**SSR Memory Pattern:**
+
+```
+Server Memory Per Request:
+[Request] → [Render: 20MB allocated] → [Response Sent] → [Memory freed]
+            Fresh start each request
+            No memory leaks across requests
+            But: concurrent requests = concurrent memory
+```
+
+**CPU Considerations:**
+
+```
+CSR: Each user's device does rendering work
+     1000 users = 1000 CPUs doing work (distributed)
+
+SSR: Server does all rendering work
+     1000 users = 1 server CPU doing 1000x work (concentrated)
+     
+Solution: Caching (SSG/ISR) or scaling servers
+```
+
+### When to Use What: Deep Analysis
+
+**Choose CSR when:**
+- Users are authenticated (can't cache anyway)
+- Data is real-time (WebSockets, polling)
+- Heavy interactivity (dashboards, editors)
+- Server costs must be minimal
+- SEO doesn't matter
+
+**Choose SSR when:**
+- SEO is critical AND data is dynamic
+- Personalization needed (user-specific content)
+- Data changes every request
+- You can handle server costs
+- First paint must include real content
+
+**Choose SSG when:**
+- Content changes rarely (docs, blogs)
+- All URLs known at build time
+- Maximum performance needed
+- Minimal server infrastructure
+- Content is same for all users
+
+**Choose ISR when:**
+- Content changes but not constantly
+- SEO needed but data updates
+- Can tolerate brief staleness
+- Want SSG benefits with some dynamism
+
+**Choose Streaming when:**
+- Parts of page have slow data dependencies
+- Want fast first paint with SSR
+- Page has mixed static/dynamic content
+- User experience during load matters
+
 ## Related Skills
 
 - See [web-app-architectures](../web-app-architectures/SKILL.md) for SPA vs MPA

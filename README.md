@@ -23,6 +23,8 @@ Rather than framework-specific instructions, these skills provide the **conceptu
 | [hydration-patterns](./hydration-patterns/SKILL.md) | Hydration, islands architecture, resumability |
 | [meta-frameworks-overview](./meta-frameworks-overview/SKILL.md) | Next.js, Nuxt, SvelteKit, Astro, Remix, Qwik |
 | [routing-patterns](./routing-patterns/SKILL.md) | Client vs server routing, file-based routing |
+| [state-management-patterns](./state-management-patterns/SKILL.md) | Client state, server state, URL state, caching |
+| [data-fetching-patterns](./data-fetching-patterns/SKILL.md) | Fetch patterns, caching, loading states |
 
 ## Learning Path
 
@@ -37,9 +39,13 @@ For best understanding, read the skills in this order:
         ↓
 4. routing-patterns          (How navigation works)
         ↓
-5. seo-fundamentals          (Search engine optimization)
+5. data-fetching-patterns    (How to load data)
         ↓
-6. meta-frameworks-overview  (How frameworks implement all of the above)
+6. state-management-patterns (Where to store data)
+        ↓
+7. seo-fundamentals          (Search engine optimization)
+        ↓
+8. meta-frameworks-overview  (How frameworks implement all of the above)
 ```
 
 ## Installation
