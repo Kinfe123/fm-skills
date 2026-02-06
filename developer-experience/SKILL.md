@@ -719,7 +719,7 @@ export default {
 // VITE'S CSS MODULE TRANSFORM:
 function transformCSSModule(css, id) {
   const { code, map, modules } = compileCSSModules(css);
-  // since we can not run logic & doesn't have all the primitive we need in css. we need to hook it with client js 
+  // since we can not run logic & doesn't have all the primitive we need in css. we need to hook it with client js. 
   return `
 import { updateStyle } from '/@vite/client';
 const css = ${JSON.stringify(code)};
