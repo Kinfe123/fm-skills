@@ -11,6 +11,7 @@ These skills help AI assistants understand:
 - SEO implications of architectural decisions
 - Universal JavaScript and cross-platform deployment (Nitro, H3, edge runtimes)
 - Middleware patterns for request/response processing (auth, CORS, rate limiting)
+- Developer experience: HMR, dev servers, error overlays, and modern tooling
 - How meta-frameworks solve common problems
 - Hydration, routing, and other core concepts
 
@@ -31,33 +32,36 @@ Rather than framework-specific instructions, these skills provide the **conceptu
 | [build-pipelines-bundling](./build-pipelines-bundling/SKILL.md) | Bundling, code splitting, tree shaking, build optimization |
 | [universal-javascript-runtimes](./universal-javascript-runtimes/SKILL.md) | Nitro, H3, unenv, web standards, cross-platform deployment |
 | [middleware-patterns](./middleware-patterns/SKILL.md) | Server/edge middleware, request pipelines, auth, CORS, rate limiting |
+| [developer-experience](./developer-experience/SKILL.md) | HMR, dev servers, Vite architecture, error overlays, fast refresh |
 
 ## Learning Path
 
 For best understanding, read the skills in this order:
 
 ```
-1. web-app-architectures       (Foundation: SPA vs MPA)
+1. web-app-architectures        (Foundation: SPA vs MPA)
         ↓
-2. build-pipelines-bundling    (How code is transformed and bundled)
+2. build-pipelines-bundling     (How code is transformed and bundled)
         ↓
-3. rendering-patterns          (When/where HTML is generated)
+3. developer-experience         (HMR, dev servers, Vite, fast tooling)
         ↓
-4. hydration-patterns          (How static becomes interactive)
+4. rendering-patterns           (When/where HTML is generated)
         ↓
-5. routing-patterns            (How navigation works)
+5. hydration-patterns           (How static becomes interactive)
         ↓
-6. data-fetching-patterns      (How to load data)
+6. routing-patterns             (How navigation works)
         ↓
-7. state-management-patterns   (Where to store data)
+7. data-fetching-patterns       (How to load data)
         ↓
-8. seo-fundamentals              (Search engine optimization)
+8. state-management-patterns    (Where to store data)
         ↓
-9. universal-javascript-runtimes (Deploy anywhere: edge, serverless, Node)
+9. seo-fundamentals             (Search engine optimization)
         ↓
-10. middleware-patterns          (Request/response pipelines, auth, CORS)
+10. universal-javascript-runtimes (Deploy anywhere: edge, serverless, Node)
         ↓
-11. meta-frameworks-overview     (How frameworks implement all of the above)
+11. middleware-patterns          (Request/response pipelines, auth, CORS)
+        ↓
+12. meta-frameworks-overview     (How frameworks implement all of the above)
 ```
 
 ## Installation
