@@ -1,6 +1,6 @@
 # Framework Skills
 
-A collection of framework-agnostic AI skills for understanding modern web development fundamentals.
+A collection of framework-agnostic AI skills for understanding & implementing modern web development fundamentals.
 
 ## Purpose
 
