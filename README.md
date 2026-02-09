@@ -66,6 +66,15 @@ For best understanding, read the skills in this order:
 
 ## Installation
 
+### Via skills.sh
+
+You can also install using [skills.sh](https://skills.sh/farming-labs/fm-skills):
+
+```bash
+npx skills add farming-labs/fm-skills
+```
+
+
 ### For Cursor IDE
 
 Copy to your personal skills directory:
